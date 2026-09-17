@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="LUZACODE V1 — aprender, criar, testar e guardar projetos de programação.">
+<title>LUZACODE V1</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+<aside class="sidebar" id="sidebar">
+  <div class="brand">
+    <div class="logo">&lt;/&gt;</div>
+    <div><strong>LUZACODE</strong><small>Aprender • Criar • Testar</small></div>
+  </div>
+  <nav>
+    <button class="nav-item active" data-page="home">⌂ <span>Início</span></button>
+    <button class="nav-item" data-page="write">⌨ <span>Escrever código</span></button>
+    <button class="nav-item" data-page="edit">✎ <span>Editar código</span></button>
+    <button class="nav-item" data-page="manual">📚 <span>Manual</span></button>
+    <button class="nav-item" data-page="courses">🎓 <span>Cursos</span></button>
+    <button class="nav-item" data-page="challenges">🧠 <span>Desafios</span></button>
+    <button class="nav-item" data-page="projects">▣ <span>Meus projetos</span></button>
+    <button class="nav-item" data-page="favorites">★ <span>Favoritos</span></button>
+  </nav>
+  <div class="sidebar-bottom">
+    <button class="nav-item" id="themeBtn">◐ <span>Modo escuro</span></button>
+    <p>Os seus projetos são guardados neste navegador.</p>
+  </div>
+</aside>
+
+<main class="main">
+<header class="topbar">
+  <button class="menu-btn" id="menuBtn">☰</button>
+  <div class="search"><span>⌕</span><input id="globalSearch" placeholder="Pesquisar no LUZACODE..."></div>
+  <button class="primary" id="newBtn">+ Novo projeto</button>
+</header>
+
+<section id="home" class="page active">
+  <div class="hero">
+    <div>
+      <span class="eyebrow">BEM-VINDO AO LUZACODE</span>
+      <h1>Aprenda e crie código <em>sem complicação.</em></h1>
+      <p>Escreva, teste, aprenda e crie os seus próprios projetos num único lugar.</p>
+      <div class="hero-actions">
+        <button class="primary" data-go="write">Começar a programar →</button>
+        <button class="secondary" data-go="manual">Aprender códigos</button>
+      </div>
+    </div>
+    <div class="code-preview">
+      <div class="dots"><i></i><i></i><i></i></div>
+      <pre><span class="pink">function</span> <span class="blue">saudar</span>() {
+  <span class="pink">return</span> <span class="green">"Olá, LUZACODE!"</span>;
+}
+console.log(saudar());</pre>
+    </div>
+  </div>
+
+  <div class="section-title"><div><span class="eyebrow">COMECE AQUI</span><h2>O que você quer fazer?</h2></div></div>
+  <div class="cards">
+    <article class="feature" data-go="write"><div class="feature-icon">⌨</div><h3>Escrever código</h3><p>Crie um projeto e veja o resultado diretamente no navegador.</p><button>Começar →</button></article>
+    <article class="feature" data-go="projects"><div class="feature-icon">▣</div><h3>Criar um projeto</h3><p>Organize os seus trabalhos, guarde alterações e baixe os arquivos.</p><button>Meus projetos →</button></article>
+    <article class="feature" data-go="manual"><div class="feature-icon">📚</div><h3>Aprender</h3><p>Consulte o manual de HTML, CSS, JavaScript e Python com exemplos simples.</p><button>Abrir manual →</button></article>
+  </div>
+
+
+</section>
+
+<section id="write" class="page">
+  <div class="page-head">
+    <div><span class="eyebrow">EDITOR</span><h1>Escrever código</h1><p>Escreva o código, execute e veja o resultado.</p></div>
+    <div class="editor-actions">
+      <input id="projectName" class="project-name" placeholder="Nome do projeto" value="Meu projeto">
+      <select id="language"><option value="html">HTML + CSS + JavaScript</option><option value="javascript">JavaScript</option></select>
+      <button class="secondary" id="saveBtn">Salvar</button>
+      <button class="primary" id="runBtn">▶ Executar</button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <label><input type="checkbox" id="lineNumbers"> Mostrar número de linhas</label>
+    <button id="fullscreenBtn">⛶ Tela cheia</button>
+    <button id="fontMinus">A−</button><button id="fontPlus">A+</button>
+    <button id="formatBtn">↕ Formatar</button>
+    <button id="clearBtn">Limpar</button>
+    <span class="shortcut">Ctrl + S para salvar • Esc para sair da tela cheia</span>
+  </div>
+
+  <div class="workspace" id="workspace">
+    <div class="code-panel" id="codePanel">
+      <div class="panel-head">
+        <strong>Editor</strong>
+        <button class="exit-fullscreen" id="exitFullscreenBtn">← Voltar</button>
+      </div>
+      <div class="editor-wrap">
+        <pre id="lineNums" aria-hidden="true"></pre>
+        <textarea id="codeEditor" spellcheck="false" aria-label="Editor de código"></textarea>
+      </div>
+    </div>
+    <div class="resize-handle" id="resizeHandle" title="Arraste para redimensionar"></div>
+    <div class="result-panel" id="resultPanel">
+      <div class="panel-head"><strong>Resultado</strong><div class="panel-head-actions"><button id="resultFullscreenBtn">⛶ Tela cheia</button><button id="refreshPreview">↻ Atualizar</button><button class="result-exit-fullscreen" id="resultExitFullscreenBtn">← Voltar</button></div></div>
+      <iframe id="preview" sandbox="allow-scripts allow-modals"></iframe>
+      <div class="console-head">Console</div>
+      <pre id="console">Pronto. Clique em “Executar”.</pre>
+    </div>
+  </div>
+</section>
+
+<section id="edit" class="page">
+  <div class="page-head"><div><span class="eyebrow">CONTINUAR</span><h1>Editar código</h1><p>Escolha um projeto salvo e continue a trabalhar.</p></div></div>
+  <div id="editProjects" class="project-grid"></div>
+</section>
+
+<section id="projects" class="page">
+  <div class="page-head">
+    <div><span class="eyebrow">PROJETOS</span><h1>Meus projetos</h1><p>Crie, organize, edite e baixe os seus projetos.</p></div>
+    <button class="primary" id="newProjectFromPage">+ Criar projeto</button>
+  </div>
+  <div class="project-help">
+    <strong>Como funciona?</strong>
+    <span>1. Crie um projeto → 2. Escreva o código → 3. Execute → 4. Salve → 5. Baixe quando quiser.</span>
+  </div>
+  <div id="projectsGrid" class="project-grid"></div>
+</section>
+
+<section id="favorites" class="page">
+  <div class="page-head"><div><span class="eyebrow">GUARDADOS</span><h1>Favoritos</h1><p>Projetos que marcou para encontrar rapidamente.</p></div></div>
+  <div id="favoritesGrid" class="project-grid"></div>
+</section>
+
+<section id="manual" class="page">
+  <div class="page-head">
+    <div><span class="eyebrow">APRENDER</span><h1>Manual de códigos</h1><p>Explicações simples, exemplos e a finalidade de cada comando.</p></div>
+    <select id="manualFilter"><option value="all">Todas as linguagens</option><option value="html">HTML</option><option value="css">CSS</option><option value="javascript">JavaScript</option><option value="python">Python</option></select>
+  </div>
+  <div class="manual-layout">
+    <aside class="manual-nav" id="manualNav"></aside>
+    <div id="manualContent" class="manual-content"></div>
+  </div>
+</section>
+
+<section id="courses" class="page">
+  <div class="page-head"><div><span class="eyebrow">APRENDIZAGEM</span><h1>Cursos</h1><p>Aprenda passo a passo, começando pelo mais fácil.</p></div><button class="secondary" id="resetCoursesBtn">↻ Reiniciar cursos</button></div>
+  <div id="coursesGrid" class="learning-grid"></div>
+  <div class="achievements-section"><div class="section-title"><div><span class="eyebrow">CONQUISTAS</span><h2>As suas conquistas</h2></div></div><div id="achievementsGrid" class="achievement-grid"></div></div>
+</section>
+
+<section id="challenges" class="page">
+  <div class="page-head"><div><span class="eyebrow">PRÁTICA</span><h1>Desafios</h1><p>Teste o que aprendeu. Escolha a dificuldade que combina consigo.</p></div></div>
+  <article class="daily-challenge" id="dailyChallenge"></article>
+  <div class="difficulty-guide">
+    <span class="easy">🟢 Fácil <small>Primeiros passos</small></span>
+    <span class="medium">🟡 Médio <small>Já conhece o básico</small></span>
+    <span class="hard">🔴 Difícil <small>Quer testar mais</small></span>
+  </div>
+  <div id="challengesGrid" class="learning-grid"></div>
+</section>
+
+<div id="toast" class="toast"></div>
+</main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
