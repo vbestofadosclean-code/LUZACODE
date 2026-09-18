@@ -6,6 +6,8 @@
 <meta name="description" content="LUZACODE V1 — aprender, criar, testar e guardar projetos de programação.">
 <title>LUZACODE V1</title>
 <link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="supabase-config.js"></script>
 </head>
 <body>
 <div class="app">
@@ -34,7 +36,7 @@
 <header class="topbar">
   <button class="menu-btn" id="menuBtn">☰</button>
   <div class="search"><span>⌕</span><input id="globalSearch" placeholder="Pesquisar no LUZACODE..."></div>
-  <button class="primary" id="newBtn">+ Novo projeto</button>
+  <div style="display:flex;gap:8px;align-items:center"><span id="accountStatus" style="font-size:12px;color:var(--muted)">Modo local</span><button class="secondary" id="accountBtn">Entrar</button><button class="primary" id="newBtn">+ Novo projeto</button></div>
 </header>
 
 <section id="home" class="page active">

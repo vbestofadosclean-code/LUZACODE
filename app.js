@@ -115,6 +115,93 @@ let courseProgress=JSON.parse(localStorage.getItem("luzacode_course_progress")||
 let completedChallenges=JSON.parse(localStorage.getItem("luzacode_completed_challenges")||"[]");
 let activeChallengeId=null;
 
+
+// Supabase: conta e sincronização na nuvem (mantém o modo local como fallback).
+let supabaseClient=null;
+let currentUser=null;
+let cloudReady=false;
+if(window.supabase && window.__SUPABASE_URL__ && window.__SUPABASE_PUBLISHABLE_KEY__){
+  supabaseClient=window.supabase.createClient(window.__SUPABASE_URL__,window.__SUPABASE_PUBLISHABLE_KEY__);
+  cloudReady=true;
+}
+function updateAccountUI(){
+  const status=$("#accountStatus"), btn=$("#accountBtn");
+  if(!status||!btn) return;
+  if(currentUser){status.textContent=currentUser.email||"Conta ligada";btn.textContent="Sair";}
+  else{status.textContent=cloudReady?"Não iniciado":"Modo local";btn.textContent="Entrar";}
+}
+function showAuthModal(){
+  if(!cloudReady){toast("A ligação ao Supabase ainda não está disponível.");return;}
+  const old=$("#authModal"); if(old) old.remove();
+  const modal=document.createElement("div"); modal.id="authModal"; modal.className="auth-modal";
+  modal.innerHTML=`<div class="auth-box"><button class="auth-close" id="authClose">×</button><span class="eyebrow">LUZACODE</span><h2>Entrar na conta</h2><p>Crie uma conta ou entre para guardar projetos e progresso na nuvem.</p><input id="authEmail" type="email" placeholder="Email"><input id="authPassword" type="password" placeholder="Palavra-passe"><div class="auth-actions"><button class="primary" id="loginAuth">Entrar</button><button class="secondary" id="signupAuth">Criar conta</button></div><div class="auth-error" id="authError"></div></div>`;
+  document.body.appendChild(modal);
+  $("#authClose").onclick=()=>modal.remove();
+  async function auth(mode){
+    const email=$("#authEmail").value.trim(), password=$("#authPassword").value;
+    $("#authError").textContent="";
+    if(!email||!password){$("#authError").textContent="Preencha email e palavra-passe.";return;}
+    const result=mode==="login"?await supabaseClient.auth.signInWithPassword({email,password}):await supabaseClient.auth.signUp({email,password});
+    if(result.error){$("#authError").textContent=result.error.message;return;}
+    if(mode==="signup" && !result.data.session){$("#authError").textContent="Conta criada. Confirme o email e depois entre.";return;}
+    modal.remove();
+  }
+  $("#loginAuth").onclick=()=>auth("login");
+  $("#signupAuth").onclick=()=>auth("signup");
+}
+async function loadCloudData(){
+  if(!currentUser) return;
+  const uid=currentUser.id;
+  const [{data:cp},{data:ch},{data:ps}] = await Promise.all([
+    supabaseClient.from("course_progress").select("course_id,exercises_completed").eq("user_id",uid),
+    supabaseClient.from("challenge_progress").select("challenge_id,completed").eq("user_id",uid),
+    supabaseClient.from("projects").select("id,name,language,code,favorite,created_at,updated_at").eq("user_id",uid).order("updated_at",{ascending:false})
+  ]);
+  if(cp){courseProgress={};cp.forEach(x=>courseProgress[x.course_id]=x.exercises_completed||0);localStorage.setItem("luzacode_course_progress",JSON.stringify(courseProgress));}
+  if(ch){completedChallenges=ch.filter(x=>x.completed).map(x=>x.challenge_id);localStorage.setItem("luzacode_completed_challenges",JSON.stringify(completedChallenges));}
+  if(ps){projects=ps.map(x=>({id:x.id,name:x.name,lang:x.language,code:x.code,favorite:x.favorite,updated:x.updated_at||x.created_at}));localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));}
+  renderProjects();renderCourses();renderChallenges();
+}
+async function syncProjectToCloud(p){
+  if(!currentUser) return;
+  const row={user_id:currentUser.id,name:p.name,language:p.lang||"html",code:p.code||"",favorite:!!p.favorite,updated_at:p.updated||new Date().toISOString()};
+  if(typeof p.id==="string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(p.id)) row.id=p.id;
+  const {data,error}=await supabaseClient.from("projects").upsert(row,{onConflict:"id"}).select().single();
+  if(error){toast("Erro ao guardar na nuvem.");console.error(error);return;}
+  if(p.id!==data.id){p.id=data.id;currentProjectId=data.id;localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));}
+}
+async function deleteProjectFromCloud(id){if(currentUser && id) await supabaseClient.from("projects").delete().eq("id",id).eq("user_id",currentUser.id);}
+async function syncCourseToCloud(id){
+  if(!currentUser)return;
+  await supabaseClient.from("course_progress").upsert({user_id:currentUser.id,course_id:id,exercises_completed:courseProgress[id]||0,updated_at:new Date().toISOString()},{onConflict:"user_id,course_id"});
+}
+async function syncChallengeToCloud(id,completed){
+  if(!currentUser)return;
+  await supabaseClient.from("challenge_progress").upsert({user_id:currentUser.id,challenge_id:id,completed,completed_at:completed?new Date().toISOString():null},{onConflict:"user_id,challenge_id"});
+}
+async function migrateLocalData(){
+  if(!currentUser)return;
+  const marker="luzacode_migrated_"+currentUser.id;
+  if(localStorage.getItem(marker)==="1") return;
+  for(const p of projects) await syncProjectToCloud(p);
+  for(const id of Object.keys(courseProgress)) await syncCourseToCloud(id);
+  for(const id of completedChallenges) await syncChallengeToCloud(Number(id),true);
+  localStorage.setItem(marker,"1");
+}
+async function initSupabase(){
+  updateAccountUI();
+  if(!supabaseClient)return;
+  const {data:{session}}=await supabaseClient.auth.getSession();
+  currentUser=session?.user||null;updateAccountUI();
+  if(currentUser){await migrateLocalData();await loadCloudData();}
+  supabaseClient.auth.onAuthStateChange(async(_event,session)=>{
+    currentUser=session?.user||null;updateAccountUI();
+    if(currentUser){await migrateLocalData();await loadCloudData();}
+  });
+}
+if($("#accountBtn")) $("#accountBtn").onclick=async()=>{if(currentUser){await supabaseClient.auth.signOut();toast("Sessão terminada.");}else showAuthModal();};
+initSupabase();
+
 function showPage(id){
   $$(".page").forEach(p=>p.classList.remove("active"));
   const page=$("#"+id); if(page) page.classList.add("active");
@@ -251,6 +338,7 @@ function runCode(){
     if(validateChallenge(code,lang,activeChallengeId)){
       completedChallenges.push(activeChallengeId);
       localStorage.setItem("luzacode_completed_challenges",JSON.stringify(completedChallenges));
+      if(currentUser) syncChallengeToCloud(activeChallengeId,true);
       activeChallengeId=null;
       toast("Desafio concluído!");
       renderChallenges();
@@ -279,6 +367,7 @@ function saveProject(){
   }
   localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));
   renderProjects(); toast("Projeto guardado.");
+  if(currentUser){ syncProjectToCloud(projects.find(x=>x.id===currentProjectId)); }
 }
 $("#saveBtn").onclick=saveProject;
 
@@ -292,11 +381,12 @@ function deleteProject(id){
   if(!confirm("Tem certeza que deseja apagar este projeto?")) return;
   projects=projects.filter(p=>p.id!==id);
   localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));
+  if(currentUser) deleteProjectFromCloud(id);
   renderProjects(); toast("Projeto apagado.");
 }
 function toggleFavorite(id){
   const p=projects.find(x=>x.id===id); if(!p) return;
-  p.favorite=!p.favorite; localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects)); renderProjects();
+  p.favorite=!p.favorite; localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects)); if(currentUser) syncProjectToCloud(p); renderProjects();
 }
 function downloadProject(id){
   const p=projects.find(x=>x.id===id); if(!p) return;
@@ -379,7 +469,7 @@ function completeCourseStep(id,next){
 }
 function resetCourses(){
   if(!confirm("Reiniciar todos os cursos? O progresso dos 3 cursos será apagado.")) return;
-  courseProgress={}; localStorage.setItem("luzacode_course_progress",JSON.stringify(courseProgress)); renderCourses(); toast("Cursos reiniciados.");
+  courseProgress={}; localStorage.setItem("luzacode_course_progress",JSON.stringify(courseProgress)); if(currentUser) courses.forEach(c=>syncCourseToCloud(c.id)); renderCourses(); toast("Cursos reiniciados.");
 }
 $("#resetCoursesBtn").onclick=resetCourses;
 function renderAchievements(){
