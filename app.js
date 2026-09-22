@@ -456,17 +456,51 @@ function toggleFavorite(id){
 function downloadProject(id){
   const p=projects.find(x=>x.id===id); if(!p) return;
   const safe=(p.name||"projeto").replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-").toLowerCase()||"projeto";
-  if(p.lang==="javascript"){
-    downloadBlob(p.code,`${safe}.js`,"text/javascript");
-  }else{
-    downloadBlob(p.code,`${safe}.html`,"text/html");
-  }
-  toast("Download iniciado.");
+  downloadProjectZip(p,safe);
 }
-function downloadBlob(content,name,type){
-  const blob=new Blob([content],{type});
-  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href),500);
+function ensureUtf8Html(code){
+  let html=String(code||"");
+  if(!/<html[\s>]/i.test(html)){
+    html=`<!DOCTYPE html>\n<html lang="pt">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>Projeto LUZACODE</title>\n</head>\n<body>\n${html}\n</body>\n</html>`;
+  }else if(!/<meta[^>]+charset\s*=\s*["']?utf-8/i.test(html)){
+    html=html.replace(/<head[^>]*>/i,m=>m+`\n<meta charset="UTF-8">`);
+  }
+  return html;
+}
+function downloadProjectZip(p,safe){
+  const files={};
+  if(p.lang==="javascript"){
+    files["index.html"]=`<!DOCTYPE html>\n<html lang="pt">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>${escapeHtml(p.name||"Projeto LUZACODE")}</title>\n</head>\n<body>\n<script src="script.js"></script>\n</body>\n</html>`;
+    files["script.js"]=String(p.code||"");
+  }else{
+    files["index.html"]=ensureUtf8Html(p.code);
+  }
+  files["README.txt"]=`Projeto criado no LUZACODE V1\n\nAbra o ficheiro index.html no navegador ou publique esta pasta num serviço de hospedagem web.\nOs ficheiros foram exportados em UTF-8 para preservar corretamente caracteres como á, à, ã, â, é, ê, í, ó, ô, õ, ú e ç.`;
+  const blob=new Blob([createZip(files)],{type:"application/zip"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=`${safe}.zip`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  toast("ZIP completo criado com UTF-8.");
+}
+function crc32(data){
+  let crc=0xffffffff;
+  for(let i=0;i<data.length;i++){ crc^=data[i]; for(let j=0;j<8;j++) crc=(crc>>>1)^(0xedb88320&-(crc&1)); }
+  return (crc^0xffffffff)>>>0;
+}
+function u16(n){return new Uint8Array([n&255,(n>>>8)&255]);}
+function u32(n){return new Uint8Array([n&255,(n>>>8)&255,(n>>>16)&255,(n>>>24)&255]);}
+function concatBytes(parts){let total=parts.reduce((n,p)=>n+p.length,0),out=new Uint8Array(total),o=0;for(const p of parts){out.set(p,o);o+=p.length;}return out;}
+function createZip(files){
+  const enc=new TextEncoder(), locals=[], centrals=[]; let offset=0;
+  for(const [name,content] of Object.entries(files)){
+    const nb=enc.encode(name), data=enc.encode(String(content)); const crc=crc32(data);
+    const local=concatBytes([u32(0x04034b50),u16(20),u16(0x0800),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(nb.length),u16(0),nb,data]);
+    locals.push(local);
+    const central=concatBytes([u32(0x02014b50),u16(20),u16(20),u16(0x0800),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u16(nb.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(offset),nb]);
+    centrals.push(central); offset+=local.length;
+  }
+  const body=concatBytes(locals), central=concatBytes(centrals);
+  const end=concatBytes([u32(0x06054b50),u16(0),u16(0),u16(centrals.length),u16(centrals.length),u32(central.length),u32(body.length),u16(0)]);
+  return concatBytes([body,central,end]);
 }
 
 function projectCard(p){
@@ -475,7 +509,7 @@ function projectCard(p){
     <div class="project-info"><h3>${escapeHtml(p.name)}</h3><p>${p.lang==="javascript"?"JavaScript":"HTML + CSS + JavaScript"} • ${formatDate(p.updated)}</p></div>
     <div class="project-actions">
       <button onclick="openProject('${p.id}')">Abrir</button>
-      <button onclick="downloadProject('${p.id}')">↓ Baixar</button>
+      <button onclick="downloadProject('${p.id}')">↓ Baixar ZIP</button>
       <button onclick="toggleFavorite('${p.id}')">${p.favorite?"★":"☆"}</button>
       <button class="danger" onclick="deleteProject('${p.id}')">Apagar</button>
     </div>
