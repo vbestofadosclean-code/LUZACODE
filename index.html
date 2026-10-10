@@ -31,8 +31,11 @@
   <div class="sidebar-bottom">
     <button class="nav-item" id="themeBtn">◐ <span>Modo escuro</span></button>
     <p>Os seus projetos são guardados neste navegador.</p>
+    <button class="nav-item sidebar-hide-btn" id="hideSidebarBtn" type="button" title="Ocultar barra lateral" aria-label="Ocultar barra lateral">«</button>
   </div>
+  <div class="sidebar-resize-handle" id="sidebarResizeHandle" title="Arraste para redimensionar a barra lateral" role="separator" aria-orientation="vertical" aria-label="Redimensionar barra lateral"></div>
 </aside>
+<button class="sidebar-show-btn" id="showSidebarBtn" type="button" title="Mostrar barra lateral" aria-label="Mostrar barra lateral">»</button>
 
 <main class="main">
 <header class="topbar">
@@ -88,15 +91,29 @@ console.log(saudar());</pre>
     <button id="fontMinus">A−</button><button id="fontPlus">A+</button>
     <button id="formatBtn">↕ Formatar</button>
     <button id="clearBtn">Limpar</button>
-    <span class="shortcut">Ctrl + S para salvar • Esc para sair da tela cheia</span>
+    <span class="shortcut">Ctrl + Shift + S para guardar • Ctrl + Enter para executar • Esc para sair da tela cheia</span>
   </div>
 
   <div class="workspace" id="workspace">
+    <aside class="project-files-panel" id="projectFilesPanel">
+      <div class="files-head">
+        <div><strong>Arquivos</strong><small id="fileLocation">Raiz do projeto</small></div>
+      </div>
+      <div class="files-actions">
+        <button id="newFileBtn">＋ Arquivo</button>
+        <button id="newFolderBtn">＋ Pasta</button>
+        <button id="importFilesBtn">↑ Importar</button>
+        <input id="importFilesInput" type="file" multiple hidden aria-label="Selecionar ficheiros para importar">
+      </div>
+      <div id="fileTree" class="file-tree" aria-label="Estrutura de arquivos do projeto"></div>
+    </aside>
+
     <div class="code-panel" id="codePanel">
       <div class="panel-head">
-        <strong>Editor</strong>
+        <div class="editor-title"><strong>Editor</strong><span id="activeFilePath">index.html</span></div>
         <button class="exit-fullscreen" id="exitFullscreenBtn">← Voltar</button>
       </div>
+      <div class="file-tabs" id="fileTabs" role="tablist" aria-label="Arquivos abertos"></div>
       <div class="editor-wrap">
         <pre id="lineNums" aria-hidden="true"></pre>
         <textarea id="codeEditor" spellcheck="false" aria-label="Editor de código"></textarea>

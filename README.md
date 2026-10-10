@@ -16,3 +16,8 @@ Versão V1 do LUZACODE para aprender, escrever, testar e guardar projetos.
 - Desafios separados por Fácil, Médio e Difícil.
 - Desafio do Dia.
 - Mantida a estrutura simples e o menu principal da versão base.
+- Árvore de ficheiros: mover ficheiros por arrastar e largar para uma pasta.
+- Copiar, cortar e colar ficheiros na árvore; Ctrl+X e Ctrl+V movem ficheiros entre pastas, preservando o conteúdo.
+- Atalhos de teclado acordados para guardar, duplicar, criar ficheiros/pastas, limpar com confirmação, formatar, executar, controlar os números de linhas e mostrar/ocultar a barra lateral.
+- Novo separador no Manual: **Manual de atalhos do LUZACODE**, com explicações sobre os 15 atalhos e a diferença entre operar sobre código e sobre ficheiros.
+- Esta continua a ser a **Versão 1 (V1)** do LUZACODE; não é a V2.

@@ -1564,7 +1564,19 @@ const challenges=[
 
 let projects=JSON.parse(localStorage.getItem("luzacode_projects_v1")||localStorage.getItem("luzacode_projects_v3")||"[]");
 let currentProjectId=null;
+let editorProject=null;
+let activeFileId=null;
+let selectedFolderId=null;
+const expandedFolderIds=new Set();
+let pendingImportFolderId;
+let editorDirty=false;
+let fileClipboard=null;
+let lastInteractionZone="app";
+let fileShortcutTargetId=null;
+const editorHistory={undo:[],redo:[],pendingTextBefore:null,textTimer:null,lastState:null,restoring:false};
+const EDITOR_HISTORY_LIMIT=80;
 let manualLanguage="html";
+let manualShortcutsActive=false;
 let manualTopic=0;
 let courseProgress=JSON.parse(localStorage.getItem("luzacode_course_progress")||"{}");
 let completedChallenges=JSON.parse(localStorage.getItem("luzacode_completed_challenges")||"[]");
@@ -1656,7 +1668,10 @@ async function loadCloudData(){
     completedChallenges=[];
     chSnap.forEach(doc=>{const x=doc.data();if(x.completed) completedChallenges.push(Number(x.challenge_id));});
     projects=[];
-    psSnap.forEach(doc=>{const x=doc.data();projects.push({id:doc.id,name:x.name,lang:x.language||"html",code:x.code||"",favorite:!!x.favorite,updated:x.updated_at||x.created_at||new Date().toISOString()});});
+    psSnap.forEach(doc=>{
+      const x=doc.data();
+      projects.push(normalizeProject({id:doc.id,name:x.name,lang:x.language||"html",code:x.code||"",files:x.files||[],favorite:!!x.favorite,updated:x.updated_at||x.created_at||new Date().toISOString(),created:x.created_at||x.updated_at||new Date().toISOString()}));
+    });
     localStorage.setItem("luzacode_course_progress",JSON.stringify(courseProgress));
     localStorage.setItem("luzacode_completed_challenges",JSON.stringify(completedChallenges));
     localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));
@@ -1671,8 +1686,12 @@ async function syncProjectToCloud(p){
   if(!currentUser||!firestoreDb||!p) return;
   try{
     const id=String(p.id||Date.now());
+    const normalized=normalizeProject(p);
+    p.files=normalized.files;
+    p.folders=normalized.folders;
+    p.code=getPrimaryFile(normalized)?.content||p.code||"";
     const ref=userCollection("projects").doc(id);
-    await ref.set({name:p.name||"Meu projeto",language:p.lang||"html",code:p.code||"",favorite:!!p.favorite,updated_at:p.updated||new Date().toISOString(),created_at:p.created||p.updated||new Date().toISOString()},{merge:true});
+    await ref.set({name:p.name||"Meu projeto",language:p.lang||"html",code:p.code||"",files:p.files||[],folders:p.folders||[],favorite:!!p.favorite,updated_at:p.updated||new Date().toISOString(),created_at:p.created||p.updated||new Date().toISOString()},{merge:true});
     if(p.id!==id){p.id=id;currentProjectId=id;localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));}
   }catch(error){console.error(error);toast("Erro ao guardar na nuvem.");}
 }
@@ -1742,14 +1761,438 @@ function toast(msg){
   clearTimeout(window.toastTimer); window.toastTimer=setTimeout(()=>t.classList.remove("show"),2200);
 }
 
+function createNodeId(prefix="node"){
+  if(window.crypto&&typeof window.crypto.randomUUID==="function") return `${prefix}_${window.crypto.randomUUID()}`;
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
+}
+
+function getFileExtension(name){
+  const value=String(name||"").trim().toLowerCase();
+  const parts=value.split(".");
+  return parts.length>1?parts.pop():"";
+}
+
+function getFileLanguage(file){
+  const ext=getFileExtension(file?.name);
+  if(["js","mjs","cjs","jsx","ts","tsx"].includes(ext)) return "javascript";
+  if(ext==="css") return "css";
+  if(["html","htm"].includes(ext)) return "html";
+  if(ext==="json") return "json";
+  if(ext==="py") return "python";
+  return "text";
+}
+
+function normalizeProject(project){
+  const p={...(project||{})};
+  p.id=String(p.id||createNodeId("project"));
+  p.name=p.name||"Meu projeto";
+  p.lang=p.lang||p.language||"html";
+  p.favorite=!!p.favorite;
+  p.updated=p.updated||new Date().toISOString();
+  p.created=p.created||p.updated;
+
+  const rawFolders=Array.isArray(project?.folders)?project.folders:[];
+  const rawFiles=Array.isArray(project?.files)?project.files:[];
+  p.folders=rawFolders.map((folder,i)=>({
+    id:String(folder.id||createNodeId("folder")),
+    name:cleanNodeName(folder.name||`pasta-${i+1}`),
+    parentId:folder.parentId?String(folder.parentId):null,
+    order:Number.isFinite(folder.order)?folder.order:i
+  })).filter(folder=>folder.name);
+  const folderIds=new Set(p.folders.map(folder=>folder.id));
+  p.folders.forEach(folder=>{if(folder.parentId&&!folderIds.has(folder.parentId)) folder.parentId=null;});
+
+  if(rawFiles.length){
+    p.files=rawFiles.map((file,i)=>({
+      id:String(file.id||createNodeId("file")),
+      name:cleanNodeName(file.name||`arquivo-${i+1}.txt`),
+      parentId:file.parentId?String(file.parentId):null,
+      content:String(file.content??file.code??""),
+      binary:!!file.binary,
+      mimeType:String(file.mimeType||"application/octet-stream"),
+      order:Number.isFinite(file.order)?file.order:i
+    })).filter(file=>file.name);
+  }else{
+    const filename=p.lang==="javascript"?"script.js":"index.html";
+    p.files=[{id:createNodeId("file"),name:filename,parentId:null,content:String(p.code||defaultCode),order:0}];
+  }
+  p.files.forEach(file=>{if(file.parentId&&!folderIds.has(file.parentId)) file.parentId=null;});
+  const primary=getPrimaryFile(p);
+  p.code=primary?.content||p.code||"";
+  return p;
+}
+
+function cleanNodeName(name){
+  return String(name||"").trim().replace(/[\\/]/g, "-").replace(/\s+/g," ");
+}
+
+function getPrimaryFile(project){
+  if(!project||!Array.isArray(project.files)) return null;
+  return project.files.find(f=>getFileExtension(f.name)==="html"&&f.parentId===null)
+    || project.files.find(f=>getFileExtension(f.name)==="html")
+    || project.files[0]
+    || null;
+}
+
+function getFolderById(id){
+  return editorProject?.folders?.find(folder=>String(folder.id)===String(id))||null;
+}
+
+function expandFolderPath(folderId){
+  let folder=getFolderById(folderId),guard=0;
+  while(folder&&guard++<100){
+    expandedFolderIds.add(String(folder.id));
+    folder=folder.parentId?getFolderById(folder.parentId):null;
+  }
+}
+
+function getFileById(id){
+  return editorProject?.files?.find(file=>String(file.id)===String(id))||null;
+}
+
+function captureEditorState(){
+  const editor=$("#codeEditor");
+  const value=editor?.value||"";
+  let projectCopy=null;
+  if(editorProject){
+    /* Copie superficielle des metadados: as strings dos ficheiros (incluindo binários grandes)
+       são imutáveis e podem ser partilhadas entre snapshots do histórico. */
+    projectCopy={...editorProject,
+      folders:(editorProject.folders||[]).map(folder=>({...folder})),
+      files:(editorProject.files||[]).map(file=>({...file}))
+    };
+    if(activeFileId){
+      const active=projectCopy.files?.find(file=>String(file.id)===String(activeFileId));
+      if(active&&!active.binary) active.content=value;
+      const primary=getPrimaryFile(projectCopy);
+      if(primary) projectCopy.code=primary.content||"";
+    }
+  }
+  return {
+    project:projectCopy,
+    currentProjectId,
+    activeFileId:activeFileId==null?null:String(activeFileId),
+    selectedFolderId:selectedFolderId==null?null:String(selectedFolderId),
+    openFileIds:Array.isArray(window.openFileIds)?window.openFileIds.map(String):[],
+    expandedFolderIds:Array.from(expandedFolderIds),
+    editorValue:value,
+    editorReadOnly:!!editor?.readOnly,
+    editorDirty:!!editorDirty,
+    projectName:$("#projectName")?.value||"Meu projeto",
+    language:$("#language")?.value||"html",
+    selectionStart:editor?.selectionStart??0,
+    selectionEnd:editor?.selectionEnd??0
+  };
+}
+
+function sameRecordList(a,b,keys){
+  if((a||[]).length!==(b||[]).length) return false;
+  for(let i=0;i<(a||[]).length;i++){
+    for(const key of keys) if(a[i]?.[key]!==b[i]?.[key]) return false;
+  }
+  return true;
+}
+function sameProjectState(a,b){
+  if(a===b) return true;
+  if(!a||!b) return false;
+  for(const key of ["id","name","lang","favorite","updated","created","code"]) if(a[key]!==b[key]) return false;
+  return sameRecordList(a.folders,b.folders,["id","name","parentId","order"])
+    &&sameRecordList(a.files,b.files,["id","name","parentId","content","binary","mimeType","order"]);
+}
+function historyStateChanged(before,after){
+  if(!before||!after) return true;
+  return !sameProjectState(before.project,after.project)
+    || before.currentProjectId!==after.currentProjectId
+    || before.activeFileId!==after.activeFileId
+    || before.selectedFolderId!==after.selectedFolderId
+    || before.editorValue!==after.editorValue
+    || before.editorReadOnly!==after.editorReadOnly
+    || before.editorDirty!==after.editorDirty
+    || before.projectName!==after.projectName
+    || before.language!==after.language
+    || before.openFileIds.join("\0")!==after.openFileIds.join("\0")
+    || before.expandedFolderIds.join("\0")!==after.expandedFolderIds.join("\0");
+}
+function pushUndoState(snapshot){
+  if(!snapshot) return;
+  editorHistory.undo.push(snapshot);
+  if(editorHistory.undo.length>EDITOR_HISTORY_LIMIT) editorHistory.undo.shift();
+  editorHistory.redo.length=0;
+}
+function flushPendingTextHistory(){
+  if(editorHistory.textTimer){clearTimeout(editorHistory.textTimer);editorHistory.textTimer=null;}
+  if(editorHistory.pendingTextBefore){
+    const before=editorHistory.pendingTextBefore;
+    const after=captureEditorState();
+    if(historyStateChanged(before,after)) pushUndoState(before);
+    editorHistory.pendingTextBefore=null;
+  }
+  if(!editorHistory.restoring) editorHistory.lastState=captureEditorState();
+}
+function resetEditorHistory(){
+  if(editorHistory.textTimer) clearTimeout(editorHistory.textTimer);
+  editorHistory.undo.length=0;
+  editorHistory.redo.length=0;
+  editorHistory.pendingTextBefore=null;
+  editorHistory.textTimer=null;
+  editorHistory.restoring=false;
+  editorHistory.lastState=captureEditorState();
+}
+function beginTrackedEdit(){
+  flushPendingTextHistory();
+  return captureEditorState();
+}
+function finishTrackedEdit(before){
+  const after=captureEditorState();
+  if(historyStateChanged(before,after)) pushUndoState(before);
+  editorHistory.lastState=after;
+}
+function syncHistoryBaseline(){
+  flushPendingTextHistory();
+  editorHistory.lastState=captureEditorState();
+}
+function restoreEditorState(snapshot){
+  if(!snapshot) return;
+  if(editorHistory.textTimer) clearTimeout(editorHistory.textTimer);
+  editorHistory.textTimer=null;
+  editorHistory.pendingTextBefore=null;
+  editorHistory.restoring=true;
+  const persistedProjectId=currentProjectId;
+  editorProject=snapshot.project?normalizeProject(snapshot.project):null;
+  currentProjectId=persistedProjectId||snapshot.currentProjectId||null;
+  if(editorProject&&currentProjectId) editorProject.id=currentProjectId;
+  activeFileId=snapshot.activeFileId&&getFileById(snapshot.activeFileId)?String(snapshot.activeFileId):String(editorProject?.files?.[0]?.id||"")||null;
+  selectedFolderId=snapshot.selectedFolderId&&getFolderById(snapshot.selectedFolderId)?String(snapshot.selectedFolderId):null;
+  window.openFileIds=(snapshot.openFileIds||[]).filter(id=>getFileById(id)).map(String);
+  if(activeFileId&&!window.openFileIds.includes(String(activeFileId))) window.openFileIds.push(String(activeFileId));
+  expandedFolderIds.clear();
+  (snapshot.expandedFolderIds||[]).forEach(id=>{if(getFolderById(id)) expandedFolderIds.add(String(id));});
+  editorDirty=!!snapshot.editorDirty;
+  const nameInput=$("#projectName"),languageInput=$("#language"),editor=$("#codeEditor");
+  if(nameInput) nameInput.value=snapshot.projectName||editorProject?.name||"Meu projeto";
+  if(languageInput) languageInput.value=snapshot.language||editorProject?.lang||"html";
+  if(editor){
+    editor.readOnly=!!snapshot.editorReadOnly;
+    const file=getFileById(activeFileId);
+    editor.value=file?.binary?(snapshot.editorValue||`[Ficheiro binário importado: ${file.name}]`):(snapshot.editorValue??file?.content??"");
+    editor.setAttribute("aria-label",file?.binary?`Ficheiro binário ${file.name}, apenas para leitura`:"Editor de código");
+    const start=Math.min(snapshot.selectionStart??0,editor.value.length);
+    const end=Math.min(snapshot.selectionEnd??start,editor.value.length);
+    try{editor.setSelectionRange(start,end);}catch{}
+  }
+  updateLines();
+  renderFileSystem();
+  editorHistory.restoring=false;
+  editorHistory.lastState=captureEditorState();
+}
+function undoEditorAction(){
+  flushPendingTextHistory();
+  if(!editorHistory.undo.length){toast("Não há acções para desfazer.");return;}
+  const current=captureEditorState();
+  const previous=editorHistory.undo.pop();
+  editorHistory.redo.push(current);
+  restoreEditorState(previous);
+  fileClipboard=null;
+  renderFileTree();
+  toast("Acção desfeita.");
+}
+function redoEditorAction(){
+  flushPendingTextHistory();
+  if(!editorHistory.redo.length){toast("Não há acções para refazer.");return;}
+  const current=captureEditorState();
+  const next=editorHistory.redo.pop();
+  editorHistory.undo.push(current);
+  if(editorHistory.undo.length>EDITOR_HISTORY_LIMIT) editorHistory.undo.shift();
+  restoreEditorState(next);
+  fileClipboard=null;
+  renderFileTree();
+  toast("Acção refeita.");
+}
+function noteCodeEditorInput(){
+  if(editorHistory.restoring){updateLines();return;}
+  lastInteractionZone="editor";
+  if(!editorHistory.pendingTextBefore) editorHistory.pendingTextBefore=editorHistory.lastState||captureEditorState();
+  if(editorHistory.textTimer) clearTimeout(editorHistory.textTimer);
+  fileClipboard=null;
+  syncTextareaToActiveFile();
+  updateLines();
+  renderFileTree();
+  renderFileTabs();
+  editorHistory.lastState=captureEditorState();
+  editorHistory.textTimer=setTimeout(flushPendingTextHistory,450);
+}
+function replaceEditorText(value,selectionStart,selectionEnd,label="Código alterado"){
+  const editor=$("#codeEditor");
+  if(!editor||editor.readOnly) return;
+  const before=beginTrackedEdit();
+  editor.value=value;
+  const start=Math.max(0,Math.min(Number(selectionStart)||0,value.length));
+  const end=Math.max(start,Math.min(Number(selectionEnd??start)||0,value.length));
+  try{editor.setSelectionRange(start,end);}catch{}
+  fileClipboard=null;
+  syncTextareaToActiveFile();
+  updateLines();renderFileTree();renderFileTabs();
+  finishTrackedEdit(before);
+  toast(label);
+}
+
+function getNodePath(node){
+  if(!node) return "";
+  const names=[node.name];
+  let parentId=node.parentId||null;
+  const seen=new Set();
+  while(parentId&&!seen.has(parentId)){
+    seen.add(parentId);
+    const folder=getFolderById(parentId);
+    if(!folder) break;
+    names.unshift(folder.name);
+    parentId=folder.parentId||null;
+  }
+  return names.join("/");
+}
+
+function getFolderPath(folderId){
+  if(!folderId) return "Raiz do projeto";
+  const folder=getFolderById(folderId);
+  return folder?getNodePath(folder):"Raiz do projeto";
+}
+
+function getChildrenFolders(parentId){
+  return (editorProject?.folders||[]).filter(folder=>(folder.parentId||null)===(parentId||null)).sort((a,b)=>a.name.localeCompare(b.name,"pt"));
+}
+
+function getChildrenFiles(parentId){
+  return (editorProject?.files||[]).filter(file=>(file.parentId||null)===(parentId||null)).sort((a,b)=>a.name.localeCompare(b.name,"pt"));
+}
+
+function isNameTaken(name,parentId,type,ignoreId=null){
+  const collection=type==="folder"?(editorProject?.folders||[]):(editorProject?.files||[]);
+  return collection.some(item=>String(item.id)!==String(ignoreId)&&item.name.toLowerCase()===name.toLowerCase()&&(item.parentId||null)===(parentId||null));
+}
+
+function getFileIcon(file){
+  const ext=getFileExtension(file.name);
+  const icons={html:"◈",css:"#",js:"JS",mjs:"JS",cjs:"JS",jsx:"JS",ts:"TS",tsx:"TS",json:"{}",py:"PY",md:"M"};
+  return icons[ext]||"•";
+}
+
+function renderFileTree(){
+  const tree=$("#fileTree"), location=$("#fileLocation");
+  if(!tree||!editorProject) return;
+  if(location) location.textContent=getFolderPath(selectedFolderId);
+  const renderLevel=(parentId,depth)=>{
+    const folders=getChildrenFolders(parentId);
+    const files=getChildrenFiles(parentId);
+    let html="";
+    folders.forEach(folder=>{
+      const expanded=expandedFolderIds.has(String(folder.id));
+      const folderId=escapeHtml(folder.id);
+      html+=`<button class="file-node folder-node ${String(selectedFolderId)===String(folder.id)?"active":""}" style="padding-left:${9+depth*17}px" data-node-type="folder" data-node-id="${folderId}" type="button" aria-expanded="${expanded}" data-drop-target="folder"><span class="file-icon">${expanded?"⌄":"›"}</span><span class="file-name">${escapeHtml(folder.name)}</span><span class="folder-import" role="button" tabindex="0" title="Importar ficheiros para esta pasta" aria-label="Importar ficheiros para ${escapeHtml(folder.name)}" data-node-action="import" data-node-type="folder" data-node-id="${folderId}">↑</span><span class="node-actions"><span role="button" tabindex="0" title="Renomear" data-node-action="rename" data-node-type="folder" data-node-id="${folderId}">✎</span><span role="button" tabindex="0" title="Apagar" data-node-action="delete" data-node-type="folder" data-node-id="${folderId}">×</span></span></button>`;
+      if(expanded) html+=renderLevel(folder.id,depth+1);
+    });
+    files.forEach(file=>{
+      html+=`<button class="file-node ${String(activeFileId)===String(file.id)?"active":""} ${fileClipboard?.mode==="cut"&&String(fileClipboard.id)===String(file.id)?"cut-pending":""}" style="padding-left:${9+depth*17}px" data-node-type="file" data-node-id="${escapeHtml(file.id)}" type="button" draggable="true" title="Arraste para uma pasta ou use Ctrl+X e Ctrl+V"><span class="file-icon">${getFileIcon(file)}</span><span class="file-name">${escapeHtml(file.name)}${editorDirty&&String(activeFileId)===String(file.id)?" •":""}</span><span class="node-actions"><span role="button" tabindex="0" title="Duplicar" data-node-action="duplicate" data-node-type="file" data-node-id="${escapeHtml(file.id)}">⧉</span><span role="button" tabindex="0" title="Renomear" data-node-action="rename" data-node-type="file" data-node-id="${escapeHtml(file.id)}">✎</span><span role="button" tabindex="0" title="Apagar" data-node-action="delete" data-node-type="file" data-node-id="${escapeHtml(file.id)}">×</span></span></button>`;
+    });
+    return html;
+  };
+  const html=renderLevel(null,0);
+  tree.innerHTML=html||`<div class="file-empty">Este projeto ainda não tem arquivos.<br>Use “＋ Arquivo” para começar.</div>`;
+}
+
+function renderFileTabs(){
+  const tabs=$("#fileTabs");
+  if(!tabs||!editorProject) return;
+  const open=(editorProject.files||[]).filter(file=>(window.openFileIds||[]).includes(String(file.id)));
+  tabs.innerHTML=open.map(file=>`<button class="file-tab ${String(activeFileId)===String(file.id)?"active":""}" data-tab-id="${escapeHtml(file.id)}" role="tab" type="button"><span class="tab-icon">${getFileIcon(file)}</span><span class="tab-name">${escapeHtml(file.name)}</span>${editorDirty&&String(activeFileId)===String(file.id)?'<span class="dirty">●</span>':""}</button>`).join("");
+}
+
+function renderFileSystem(){
+  renderFileTree();
+  renderFileTabs();
+  const file=getFileById(activeFileId);
+  const title=$("#activeFilePath");
+  if(title) title.textContent=file?getNodePath(file):"Nenhum arquivo";
+  if(file&&$("#fileLocation")) $("#fileLocation").textContent=getFolderPath(file.parentId);
+}
+
+function syncTextareaToActiveFile(){
+  const file=getFileById(activeFileId);
+  if(!file||!$("#codeEditor")||file.binary) return;
+  const value=$("#codeEditor").value;
+  if(file.content!==value) editorDirty=true;
+  file.content=value;
+  const primary=getPrimaryFile(editorProject);
+  if(primary) editorProject.code=primary.content;
+}
+
+function showFileInEditor(file){
+  const editor=$("#codeEditor");
+  if(!editor) return;
+  editor.readOnly=!!file?.binary;
+  editor.value=file?.binary
+    ? `[Ficheiro binário importado: ${file.name}]\nTipo: ${file.mimeType||"desconhecido"}\nEste ficheiro será mantido intacto. Use “Baixar” para o exportar.`
+    : (file?.content||"");
+  editor.setAttribute("aria-label",file?.binary?`Ficheiro binário ${file.name}, apenas para leitura`:"Editor de código");
+}
+
+function loadActiveFile(fileId,focus=false){
+  if(!editorProject) return;
+  flushPendingTextHistory();
+  syncTextareaToActiveFile();
+  const file=getFileById(fileId);
+  if(!file) return;
+  activeFileId=String(file.id);
+  selectedFolderId=file.parentId||null;
+  window.openFileIds=Array.isArray(window.openFileIds)?window.openFileIds.map(String):[];
+  if(!window.openFileIds.includes(String(file.id))) window.openFileIds.push(String(file.id));
+  showFileInEditor(file);
+  editorDirty=false;
+  updateLines();
+  renderFileSystem();
+  if(focus) $("#codeEditor").focus();
+  syncHistoryBaseline();
+}
+
+function makeDefaultProject(){
+  const indexId=createNodeId("file");
+  const cssId=createNodeId("file");
+  const jsId=createNodeId("file");
+  const files=[
+    {id:indexId,name:"index.html",parentId:null,order:0,content:`<!DOCTYPE html>\n<html lang="pt">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>Meu projeto</title>\n  <link rel="stylesheet" href="style.css">\n</head>\n<body>\n  <h1>Olá, LUZACODE!</h1>\n  <p>Edite os arquivos do projeto e execute para ver o resultado.</p>\n  <button id="btnSaudar">Clique aqui</button>\n  <script src="script.js"></script>\n</body>\n</html>`},
+    {id:cssId,name:"style.css",parentId:null,order:1,content:`body {\n  font-family: Arial, sans-serif;\n  padding: 40px;\n}\n\nh1 {\n  color: #4f46e5;\n}\n\nbutton {\n  padding: 10px 15px;\n  cursor: pointer;\n}`},
+    {id:jsId,name:"script.js",parentId:null,order:2,content:`const botao = document.getElementById("btnSaudar");\n\nbotao.addEventListener("click", () => {\n  console.log("Botão clicado.");\n  alert("Você executou JavaScript!");\n});`}
+  ];
+  return {id:null,name:"Meu projeto",lang:"html",code:files[0].content,files,folders:[],favorite:false,updated:new Date().toISOString(),created:new Date().toISOString()};
+}
+
 function resetEditor(){
   currentProjectId=null;
+  editorProject=makeDefaultProject();
+  activeFileId=String(editorProject.files[0].id);
+  selectedFolderId=null;
+  window.openFileIds=[activeFileId];
+  editorDirty=false;
   $("#projectName").value="Meu projeto";
   $("#language").value="html";
-  $("#codeEditor").value=defaultCode;
+  $("#codeEditor").readOnly=false;
+  $("#codeEditor").value=editorProject.files[0].content;
+  $("#codeEditor").setAttribute("aria-label","Editor de código");
   updateLines();
-  $("#console").textContent="Novo projeto pronto. Clique em “Executar”.";
+  renderFileSystem();
+  $("#console").textContent="Novo projeto pronto. Crie arquivos e pastas e clique em “Executar”.";
+  fileClipboard=null;
+  fileShortcutTargetId=null;
+  lastInteractionZone="app";
+  resetEditorHistory();
 }
+
+function ensureEditorProject(){
+  if(!editorProject){resetEditor();}
+  editorProject=normalizeProject(editorProject);
+  if(!activeFileId||!getFileById(activeFileId)) activeFileId=String(editorProject.files[0]?.id||"");
+  window.openFileIds=Array.isArray(window.openFileIds)&&window.openFileIds.length?window.openFileIds.map(String):[String(activeFileId)];
+}
+
 function newProject(){
   resetEditor(); showPage("write"); $("#codeEditor").focus(); toast("Novo projeto criado.");
 }
@@ -1760,8 +2203,392 @@ function updateLines(){
   const count=$("#codeEditor").value.split("\n").length;
   $("#lineNums").textContent=Array.from({length:count},(_,i)=>i+1).join("\n");
 }
-$("#codeEditor").oninput=updateLines;
+$("#codeEditor").oninput=noteCodeEditorInput;
+$("#codeEditor").addEventListener("focus",()=>{lastInteractionZone="editor";});
+$("#codeEditor").addEventListener("pointerdown",()=>{lastInteractionZone="editor";});
 $("#codeEditor").onscroll=()=>$("#lineNums").scrollTop=$("#codeEditor").scrollTop;
+
+function createFile(){
+  const historyBefore=beginTrackedEdit();
+  ensureEditorProject();
+  const folderId=selectedFolderId||null;
+  let name=prompt(`Nome do novo arquivo${folderId?` dentro de “${getFolderById(folderId)?.name||"pasta"}”`:" na raiz do projeto"}:`,"index.html");
+  if(name===null) return;
+  name=cleanNodeName(name);
+  if(!name) return toast("Indique um nome para o arquivo.");
+  if(!name.includes(".")) name += ".txt";
+  if(isNameTaken(name,folderId,"file")) return toast("Já existe um arquivo com esse nome nessa pasta.");
+  const ext=getFileExtension(name);
+  let content="";
+  if(ext==="html") content='<!DOCTYPE html>\n<html lang="pt">\n<head>\n  <meta charset="UTF-8">\n  <title>Novo arquivo</title>\n</head>\n<body>\n\n</body>\n</html>';
+  else if(ext==="css") content='body {\n  margin: 0;\n}\n';
+  else if(["js","mjs","cjs","jsx","ts","tsx"].includes(ext)) content='// Novo arquivo JavaScript\n';
+  else if(ext==="json") content='{}';
+  const file={id:createNodeId("file"),name,parentId:folderId,content,order:Date.now()};
+  editorProject.files.push(file);
+  if(folderId) expandFolderPath(folderId);
+  activeFileId=String(file.id);
+  window.openFileIds=Array.isArray(window.openFileIds)?window.openFileIds.map(String):[];
+  window.openFileIds.push(String(file.id));
+  $("#codeEditor").readOnly=false;
+  $("#codeEditor").setAttribute("aria-label","Editor de código");
+  $("#codeEditor").value=content;
+  editorDirty=true;
+  updateLines();
+  renderFileSystem();
+  $("#codeEditor").focus();
+  finishTrackedEdit(historyBefore);
+  toast(`Arquivo “${name}” criado.`);
+}
+
+function createFolder(){
+  const historyBefore=beginTrackedEdit();
+  ensureEditorProject();
+  const parentId=selectedFolderId||null;
+  let name=prompt(`Nome da nova pasta${parentId?` dentro de “${getFolderById(parentId)?.name||"pasta"}”`:" na raiz do projeto"}:`,"nova-pasta");
+  if(name===null) return;
+  name=cleanNodeName(name);
+  if(!name) return toast("Indique um nome para a pasta.");
+  if(isNameTaken(name,parentId,"folder")) return toast("Já existe uma pasta com esse nome nesse local.");
+  const folder={id:createNodeId("folder"),name,parentId,order:Date.now()};
+  editorProject.folders.push(folder);
+  if(parentId) expandFolderPath(parentId);
+  selectedFolderId=String(folder.id);
+  renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast(`Pasta “${name}” criada.`);
+}
+
+function renameNode(type,id){
+  const historyBefore=beginTrackedEdit();
+  ensureEditorProject();
+  const collection=type==="folder"?editorProject.folders:editorProject.files;
+  const node=collection.find(item=>String(item.id)===String(id));
+  if(!node) return;
+  let name=prompt("Novo nome:",node.name);
+  if(name===null) return;
+  name=cleanNodeName(name);
+  if(!name) return toast("O nome não pode ficar vazio.");
+  if(type==="file"&&!name.includes(".")) name += ".txt";
+  if(isNameTaken(name,node.parentId||null,type,node.id)) return toast("Já existe um item com esse nome nesse local.");
+  node.name=name;
+  editorDirty=true;
+  renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast("Nome atualizado.");
+}
+
+function duplicateFile(id){
+  const historyBefore=beginTrackedEdit();
+  ensureEditorProject();
+  const source=getFileById(id); if(!source) return;
+  const dot=source.name.lastIndexOf(".");
+  const base=dot>0?source.name.slice(0,dot):source.name;
+  const ext=dot>0?source.name.slice(dot):"";
+  let name=`${base} copy${ext}`;
+  let n=2;
+  while(isNameTaken(name,source.parentId||null,"file")) name=`${base} copy ${n++}${ext}`;
+  const file={id:createNodeId("file"),name,parentId:source.parentId||null,content:source.content,binary:!!source.binary,mimeType:source.mimeType||"application/octet-stream",order:Date.now()};
+  editorProject.files.push(file);
+  activeFileId=String(file.id);
+  window.openFileIds=Array.isArray(window.openFileIds)?window.openFileIds.map(String):[];
+  window.openFileIds.push(String(file.id));
+  showFileInEditor(file);
+  editorDirty=false;
+  updateLines();
+  renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast(`Cópia “${name}” criada.`);
+}
+
+function removeFolderRecursive(folderId){
+  const ids=new Set([String(folderId)]);
+  let changed=true;
+  while(changed){
+    changed=false;
+    (editorProject.folders||[]).forEach(folder=>{
+      if(folder.parentId&&ids.has(String(folder.parentId))&&!ids.has(String(folder.id))){ids.add(String(folder.id));changed=true;}
+    });
+  }
+  editorProject.folders=editorProject.folders.filter(folder=>!ids.has(String(folder.id)));
+  editorProject.files=editorProject.files.filter(file=>!file.parentId||!ids.has(String(file.parentId)));
+  if(activeFileId&&!getFileById(activeFileId)){
+    const next=editorProject.files[0];
+    activeFileId=next?String(next.id):null;
+    window.openFileIds=next?[String(next.id)]:[];
+    showFileInEditor(next);
+  }
+}
+
+function deleteNode(type,id){
+  const historyBefore=beginTrackedEdit();
+  ensureEditorProject();
+  if(type==="file"){
+    if(editorProject.files.length<=1) return toast("O projeto precisa ter pelo menos um arquivo.");
+    const file=getFileById(id); if(!file) return;
+    if(!confirm(`Apagar “${file.name}”?`)) return;
+    syncTextareaToActiveFile();
+    editorProject.files=editorProject.files.filter(item=>String(item.id)!==String(id));
+    window.openFileIds=(window.openFileIds||[]).filter(openId=>String(openId)!==String(id));
+    if(String(activeFileId)===String(id)){
+      const next=editorProject.files[0];
+      activeFileId=next?String(next.id):null;
+      showFileInEditor(next);
+    }
+  }else{
+    const folder=getFolderById(id); if(!folder) return;
+    if(!confirm(`Apagar a pasta “${folder.name}” e todo o seu conteúdo?`)) return;
+    syncTextareaToActiveFile();
+    removeFolderRecursive(id);
+    if(String(selectedFolderId)===String(id)) selectedFolderId=folder.parentId||null;
+  }
+  editorDirty=true;
+  updateLines();
+  renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast("Item apagado.");
+}
+
+$("#newFileBtn").onclick=createFile;
+$("#newFolderBtn").onclick=createFolder;
+$("#importFilesBtn").onclick=()=>{pendingImportFolderId=undefined;$("#importFilesInput").click();};
+
+const textFileExtensions=new Set(["txt","html","htm","css","js","mjs","cjs","jsx","ts","tsx","json","py","md","markdown","xml","csv","svg","sql","yml","yaml","ini","conf","log","sh","bash","bat","cmd","ps1","php","java","c","h","cpp","hpp","cs","go","rs","rb","pl","swift","kt","dart","vue","svelte","tex","tsv","properties","toml","env","gitignore","lock","r","ipynb","gradle","makefile","dockerfile","graphql","gql","astro","less","scss","sass"]);
+function bytesToBase64(bytes){
+  let binary="";
+  const chunkSize=0x8000;
+  for(let i=0;i<bytes.length;i+=chunkSize) binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+chunkSize,bytes.length)));
+  return btoa(binary);
+}
+function base64ToBytes(value){
+  const binary=atob(String(value||""));
+  const bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+  return bytes;
+}
+function uniqueImportedName(original,parentId){
+  let name=cleanNodeName(original)||"ficheiro-importado.txt";
+  if(!isNameTaken(name,parentId,"file")) return name;
+  const dot=name.lastIndexOf("."),base=dot>0?name.slice(0,dot):name,ext=dot>0?name.slice(dot):"";
+  let n=2,candidate=`${base} (${n})${ext}`;
+  while(isNameTaken(candidate,parentId,"file")) candidate=`${base} (${++n})${ext}`;
+  return candidate;
+}
+async function importSelectedFiles(fileList){
+  ensureEditorProject();
+  const requestedParentId=pendingImportFolderId;
+  pendingImportFolderId=undefined;
+  const selected=Array.from(fileList||[]);
+  if(!selected.length) return;
+  const historyBefore=beginTrackedEdit();
+  const parentId=requestedParentId!==undefined?requestedParentId:(selectedFolderId||null);
+  const collisions=selected.filter(picked=>{
+    const name=cleanNodeName(picked.name).toLowerCase();
+    return editorProject.files.some(file=>file.name.toLowerCase()===name&&(file.parentId||null)===(parentId||null));
+  });
+  const replaceConflicts=collisions.length?confirm(`Já existem ${collisions.length} ficheiro(s) com o mesmo nome.\n\nOK — substituir os ficheiros existentes.\nCancelar — importar cópias com nomes alternativos.`):false;
+  let imported=0,failed=0,firstId=null;
+  const replacedIds=new Set();
+  for(const picked of selected){
+    try{
+      const bytes=new Uint8Array(await picked.arrayBuffer());
+      const ext=getFileExtension(picked.name);
+      const isText=(picked.type||"").startsWith("text/")||textFileExtensions.has(ext)||["application/json","application/javascript","application/xml","application/x-sh","application/sql"].includes((picked.type||"").toLowerCase());
+      const content=isText?new TextDecoder("utf-8").decode(bytes):bytesToBase64(bytes);
+      const binary=!isText,mimeType=picked.type||"application/octet-stream";
+      const cleanName=cleanNodeName(picked.name)||"ficheiro-importado.txt";
+      const existing=replaceConflicts?editorProject.files.find(file=>!replacedIds.has(String(file.id))&&file.name.toLowerCase()===cleanName.toLowerCase()&&(file.parentId||null)===(parentId||null)):null;
+      if(existing){
+        replacedIds.add(String(existing.id));
+        existing.content=content;existing.binary=binary;existing.mimeType=mimeType;
+        if(!firstId)firstId=String(existing.id);
+      }else{
+        const file={id:createNodeId("file"),name:uniqueImportedName(cleanName,parentId),parentId,content,binary,mimeType,order:Date.now()+imported};
+        editorProject.files.push(file);
+        if(!firstId)firstId=String(file.id);
+      }
+      imported++;
+    }catch(err){console.error("Falha ao importar ficheiro:",picked?.name,err);failed++;}
+  }
+  if(imported){
+    editorDirty=true;
+    if(parentId){
+      selectedFolderId=String(parentId);
+      expandFolderPath(parentId);
+    }
+    if(firstId){
+      const first=getFileById(firstId);
+      activeFileId=firstId;
+      window.openFileIds=Array.isArray(window.openFileIds)?window.openFileIds.map(String):[];
+      if(!window.openFileIds.includes(firstId)) window.openFileIds.push(firstId);
+      showFileInEditor(first);
+    }
+    updateLines();renderFileSystem();
+    finishTrackedEdit(historyBefore);
+    toast(`${imported} ficheiro(s) importado(s)${failed?`; ${failed} falharam`:""}.`);
+  }else{
+    finishTrackedEdit(historyBefore);
+    toast("Não foi possível importar os ficheiros selecionados.");
+  }
+  $("#importFilesInput").value="";
+}
+$("#importFilesInput").addEventListener("change",e=>importSelectedFiles(e.target.files));
+$("#importFilesInput").addEventListener("cancel",()=>{pendingImportFolderId=undefined;});
+
+$("#fileTree").onclick=e=>{
+  const action=e.target.closest("[data-node-action]");
+  if(action){
+    e.preventDefault();e.stopPropagation();
+    fileShortcutTargetId=null;
+    const type=action.dataset.nodeType,id=action.dataset.nodeId,op=action.dataset.nodeAction;
+    if(op==="import"&&type==="folder"){
+      syncTextareaToActiveFile();
+      selectedFolderId=String(id);
+      expandFolderPath(id);
+      pendingImportFolderId=String(id);
+      renderFileSystem();
+      $("#importFilesInput").click();
+    }
+    if(op==="rename") renameNode(type,id);
+    if(op==="duplicate"&&type==="file") duplicateFile(id);
+    if(op==="delete") deleteNode(type,id);
+    return;
+  }
+  const node=e.target.closest("[data-node-id]");
+  if(!node) return;
+  const type=node.dataset.nodeType,id=node.dataset.nodeId;
+  if(type==="folder"){
+    flushPendingTextHistory();
+    syncTextareaToActiveFile();
+    lastInteractionZone="fileTree";
+    fileShortcutTargetId=null;
+    selectedFolderId=String(id);
+    if(expandedFolderIds.has(String(id))) expandedFolderIds.delete(String(id));
+    else expandFolderPath(id);
+    renderFileSystem();
+    syncHistoryBaseline();
+  }else{
+    loadActiveFile(id,true);
+    lastInteractionZone="fileTree";
+    fileShortcutTargetId=String(id);
+  }
+};
+$("#fileTabs").onclick=e=>{
+  const tab=e.target.closest("[data-tab-id]");
+  if(tab){
+    loadActiveFile(tab.dataset.tabId,true);
+    lastInteractionZone="fileTree";
+    fileShortcutTargetId=String(tab.dataset.tabId);
+  }
+};
+
+function uniqueCopiedFileName(fileName,parentId){
+  const dot=fileName.lastIndexOf(".");
+  const base=dot>0?fileName.slice(0,dot):fileName;
+  const ext=dot>0?fileName.slice(dot):"";
+  let candidate=`${base} copy${ext}`,n=2;
+  while(isNameTaken(candidate,parentId,"file")) candidate=`${base} copy ${n++}${ext}`;
+  return candidate;
+}
+function moveFileToFolder(fileId,destinationFolderId){
+  ensureEditorProject();
+  const file=getFileById(fileId);
+  if(!file) return false;
+  const parentId=destinationFolderId?String(destinationFolderId):null;
+  if(parentId&&!getFolderById(parentId)){toast("A pasta de destino já não existe.");return false;}
+  if((file.parentId||null)===(parentId||null)){toast("O ficheiro já está nesta pasta.");return false;}
+  const historyBefore=beginTrackedEdit();
+  syncTextareaToActiveFile();
+  let renamed=false;
+  if(isNameTaken(file.name,parentId,"file",file.id)){
+    file.name=uniqueImportedName(file.name,parentId);
+    renamed=true;
+  }
+  file.parentId=parentId;
+  if(parentId){selectedFolderId=parentId;expandFolderPath(parentId);}else selectedFolderId=null;
+  editorDirty=true;
+  renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast(renamed?`Ficheiro movido e renomeado para “${file.name}” por existir um nome igual.`:`Ficheiro “${file.name}” movido para ${parentId?`“${getFolderById(parentId)?.name||"pasta"}”`:"a raiz do projeto"}.`);
+  return true;
+}
+function copyFileToFolder(fileId,destinationFolderId){
+  ensureEditorProject();
+  syncTextareaToActiveFile();
+  const source=getFileById(fileId);
+  if(!source) return false;
+  const parentId=destinationFolderId?String(destinationFolderId):null;
+  if(parentId&&!getFolderById(parentId)){toast("A pasta de destino já não existe.");return false;}
+  const historyBefore=beginTrackedEdit();
+  const file={id:createNodeId("file"),name:uniqueCopiedFileName(source.name,parentId),parentId,content:source.content,binary:!!source.binary,mimeType:source.mimeType||"application/octet-stream",order:Date.now()};
+  editorProject.files.push(file);
+  selectedFolderId=parentId;
+  if(parentId) expandFolderPath(parentId);
+  activeFileId=String(file.id);
+  window.openFileIds=Array.isArray(window.openFileIds)?window.openFileIds.map(String):[];
+  window.openFileIds.push(String(file.id));
+  showFileInEditor(file);
+  editorDirty=true;
+  updateLines();renderFileSystem();
+  finishTrackedEdit(historyBefore);
+  toast(`Ficheiro copiado para “${getFolderById(parentId)?.name||"raiz do projeto"}”.`);
+  return true;
+}
+function pasteFileClipboard(){
+  if(!fileClipboard) return false;
+  const clipboard={...fileClipboard};
+  if(!getFileById(clipboard.id)){fileClipboard=null;renderFileTree();toast("O ficheiro copiado já não existe.");return true;}
+  const destination=selectedFolderId||null;
+  if(clipboard.mode==="cut"){
+    const moved=moveFileToFolder(clipboard.id,destination);
+    fileClipboard=null;
+    renderFileTree();
+    if(!moved) syncHistoryBaseline();
+    return true;
+  }
+  copyFileToFolder(clipboard.id,destination);
+  renderFileTree();
+  return true;
+}
+
+let draggingProjectFileId=null;
+$("#fileTree").addEventListener("dragstart",e=>{
+  const fileNode=e.target.closest('.file-node[data-node-type="file"]');
+  if(!fileNode||!getFileById(fileNode.dataset.nodeId)) return;
+  draggingProjectFileId=String(fileNode.dataset.nodeId);
+  e.dataTransfer?.setData("text/plain",`luzacode-file:${draggingProjectFileId}`);
+  if(e.dataTransfer) e.dataTransfer.effectAllowed="move";
+  fileNode.classList.add("dragging");
+  fileClipboard=null;
+});
+$("#fileTree").addEventListener("dragover",e=>{
+  if(!draggingProjectFileId||!getFileById(draggingProjectFileId)) return;
+  e.preventDefault();
+  if(e.dataTransfer) e.dataTransfer.dropEffect="move";
+  $("#fileTree").querySelectorAll(".drop-target").forEach(node=>node.classList.remove("drop-target"));
+  const folderNode=e.target.closest('.folder-node[data-drop-target="folder"]');
+  if(folderNode) folderNode.classList.add("drop-target");
+});
+$("#fileTree").addEventListener("dragleave",e=>{
+  if(e.relatedTarget&&$("#fileTree").contains(e.relatedTarget)) return;
+  $("#fileTree").querySelectorAll(".drop-target").forEach(node=>node.classList.remove("drop-target"));
+});
+$("#fileTree").addEventListener("drop",e=>{
+  if(!draggingProjectFileId||!getFileById(draggingProjectFileId)) return;
+  e.preventDefault();
+  const folderNode=e.target.closest('.folder-node[data-drop-target="folder"]');
+  const destination=folderNode?folderNode.dataset.nodeId:null;
+  const fileId=draggingProjectFileId;
+  const siblingFile=e.target.closest('.file-node[data-node-type="file"]');
+  const actualDestination=folderNode?destination:(siblingFile?(getFileById(siblingFile.dataset.nodeId)?.parentId||null):null);
+  draggingProjectFileId=null;
+  $("#fileTree").querySelectorAll(".drop-target,.dragging").forEach(node=>node.classList.remove("drop-target","dragging"));
+  moveFileToFolder(fileId,actualDestination);
+});
+$("#fileTree").addEventListener("dragend",()=>{
+  draggingProjectFileId=null;
+  $("#fileTree").querySelectorAll(".drop-target,.dragging").forEach(node=>node.classList.remove("drop-target","dragging"));
+});
 
 $("#lineNumbers").onchange=e=>{
   $("#codePanel").classList.toggle("show-lines",e.target.checked); updateLines();
@@ -1801,27 +2628,137 @@ $("#resultFullscreenBtn").onclick=enterResultFullscreen;
 $("#resultExitFullscreenBtn").onclick=exitResultFullscreen;
 $("#fullscreenBtn").onclick=enterFullscreen;
 $("#exitFullscreenBtn").onclick=exitFullscreen;
+function isEditableTarget(target){
+  return !!target&&(target.isContentEditable||target.matches?.("input,textarea,select")&&target.id!=="codeEditor");
+}
+function duplicateEditorSelectionOrLine(){
+  const editor=$("#codeEditor");
+  if(!editor||editor.readOnly) return false;
+  const value=editor.value;
+  let start=editor.selectionStart,end=editor.selectionEnd,chunk="",insertAt=0;
+  if(end>start){
+    chunk=value.slice(start,end);
+    insertAt=end;
+  }else{
+    const lineStart=value.lastIndexOf("\n",Math.max(0,start-1))+1;
+    const nextBreak=value.indexOf("\n",start);
+    const lineEnd=nextBreak===-1?value.length:nextBreak+1;
+    chunk=value.slice(lineStart,lineEnd);
+    insertAt=lineEnd;
+    if(lineEnd===value.length&&chunk&&!chunk.endsWith("\n")) chunk="\n"+chunk;
+  }
+  if(!chunk) return false;
+  replaceEditorText(value.slice(0,insertAt)+chunk+value.slice(insertAt),insertAt,insertAt+chunk.length,"Código duplicado.");
+  editor.focus();
+  return true;
+}
+function handleFileCopyCut(e,mode){
+  const target=e.target;
+  if(isEditableTarget(target)) return;
+  const fileNode=target.closest?.('.file-node[data-node-type="file"]');
+  const fileTab=target.closest?.('#fileTabs [data-tab-id]');
+  // Depois de abrir um ficheiro, o foco passa para o editor. Usa-se o último ficheiro seleccionado na árvore apenas enquanto essa área continuar activa.
+  const fileId=String(fileNode?.dataset.nodeId||fileTab?.dataset.tabId||(lastInteractionZone==="fileTree"?fileShortcutTargetId:"")||"");
+  if(!fileId||!getFileById(fileId)) return;
+  if(String(activeFileId)!==fileId) loadActiveFile(fileId,true);
+  syncTextareaToActiveFile();
+  fileClipboard={id:fileId,mode};
+  e.preventDefault();
+  renderFileTree();
+  toast(mode==="cut"?"Ficheiro cortado. Seleccione a pasta de destino e prima Ctrl+V.":"Ficheiro copiado. Seleccione uma pasta e prima Ctrl+V para colar uma cópia.");
+}
+document.addEventListener("pointerdown",e=>{
+  if(e.target.closest?.("#fileTree")||e.target.closest?.("#fileTabs")){lastInteractionZone="fileTree";return;}
+  if(e.target.closest?.("#codeEditor")){lastInteractionZone="editor";return;}
+  lastInteractionZone="app";
+},true);
 document.addEventListener("keydown",e=>{
   if(e.key==="Escape" && $("#codePanel").classList.contains("fullscreen")) exitFullscreen();
   if(e.key==="Escape" && $("#resultPanel").classList.contains("result-fullscreen")) exitResultFullscreen();
-  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){e.preventDefault();saveProject();}
+
+  const ctrl=e.ctrlKey||e.metaKey;
+  const key=String(e.key||"").toLowerCase();
+  const editor=$("#codeEditor");
+  const editorFocused=e.target===editor;
+  const editableElsewhere=isEditableTarget(e.target);
+
+  if(ctrl&&key==="c"&&!e.shiftKey&&!e.altKey){
+    if(editorFocused&&editor.selectionEnd>editor.selectionStart){fileClipboard=null;renderFileTree();return;}
+    if(editorFocused&&lastInteractionZone!=="fileTree") return;
+    handleFileCopyCut(e,"copy");
+    return;
+  }
+  if(ctrl&&key==="x"&&!e.shiftKey&&!e.altKey){
+    if(editorFocused&&editor.selectionEnd>editor.selectionStart){fileClipboard=null;renderFileTree();return;}
+    if(editorFocused&&lastInteractionZone!=="fileTree") return;
+    handleFileCopyCut(e,"cut");
+    return;
+  }
+  if(ctrl&&key==="v"&&!e.shiftKey&&!e.altKey){
+    const fileContext=lastInteractionZone==="fileTree"||!!e.target.closest?.("#fileTree")||!!e.target.closest?.("#fileTabs");
+    if(fileClipboard&&fileContext&&!editableElsewhere){e.preventDefault();pasteFileClipboard();return;}
+    return;
+  }
+  if(ctrl&&key==="z"&&!e.shiftKey&&!e.altKey){
+    if(editableElsewhere)return;
+    e.preventDefault();undoEditorAction();return;
+  }
+  if(ctrl&&key==="y"&&!e.shiftKey&&!e.altKey){
+    if(editableElsewhere)return;
+    e.preventDefault();redoEditorAction();return;
+  }
+  if(ctrl&&e.shiftKey&&key==="s"&&!e.altKey){e.preventDefault();flushPendingTextHistory();saveProject();return;}
+  if(ctrl&&e.shiftKey&&key==="k"&&!e.altKey){
+    e.preventDefault();
+    if(editorFocused&&lastInteractionZone==="editor"&&!editor.readOnly){duplicateEditorSelectionOrLine();}
+    else if(activeFileId) duplicateFile(activeFileId);
+    return;
+  }
+  if(ctrl&&e.shiftKey&&key==="g"&&!e.altKey){e.preventDefault();createFolder();return;}
+  if(ctrl&&e.shiftKey&&key==="e"&&!e.altKey){e.preventDefault();createFile();return;}
+  if(ctrl&&e.shiftKey&&key==="l"&&!e.altKey){e.preventDefault();clearEditorCode();return;}
+  if(e.altKey&&e.shiftKey&&key==="f"&&!ctrl){e.preventDefault();formatCode();return;}
+  if(ctrl&&key==="m"&&!e.shiftKey&&!e.altKey){
+    e.preventDefault();
+    const checkbox=$("#lineNumbers");checkbox.checked=!checkbox.checked;
+    $("#codePanel").classList.toggle("show-lines",checkbox.checked);updateLines();
+    toast(checkbox.checked?"Números de linhas activados.":"Números de linhas ocultos.");return;
+  }
+  if(ctrl&&e.key==="Enter"&&!e.shiftKey&&!e.altKey){e.preventDefault();runCode();return;}
+  if(ctrl&&key==="b"&&!e.shiftKey&&!e.altKey){
+    e.preventDefault();
+    if(document.body.classList.contains("sidebar-collapsed")) $("#showSidebarBtn").click();
+    else $("#hideSidebarBtn").click();
+    return;
+  }
 });
 
 function formatCode(){
-  const ta=$("#codeEditor"), code=ta.value;
-  if($("#language").value==="javascript"){
+  const historyBefore=beginTrackedEdit();
+  const ta=$("#codeEditor"), code=ta.value, file=getFileById(activeFileId), fileLang=getFileLanguage(file);
+  if(file?.binary){toast("Este é um ficheiro binário e não pode ser formatado como texto.");return;}
+  if(fileLang==="javascript"||$("#language").value==="javascript"){
     ta.value=code.replace(/;\s*/g,";\n").replace(/\{\s*/g," {\n").replace(/\}\s*/g,"}\n").replace(/\n{2,}/g,"\n").trim();
   } else {
     ta.value=code.replace(/>\s*</g,">\n<").replace(/\n{2,}/g,"\n").trim();
   }
-  updateLines(); toast("Código organizado.");
+  syncTextareaToActiveFile();
+  updateLines(); renderFileTree(); renderFileTabs();
+  finishTrackedEdit(historyBefore);
+  toast("Código organizado.");
 }
 $("#formatBtn").onclick=formatCode;
-$("#clearBtn").onclick=()=>{
-  if(confirm("Limpar o editor? O código atual será substituído por vazio.")){
-    $("#codeEditor").value=""; updateLines(); $("#console").textContent="Editor limpo.";
+function clearEditorCode(){
+  const file=getFileById(activeFileId);
+  if(file?.binary){toast("Este ficheiro binário não pode ser limpo no editor de texto.");return;}
+  if(confirm("Tem a certeza de que pretende limpar todo o código deste ficheiro? Esta acção pode ser desfeita com Ctrl+Z.")){
+    const historyBefore=beginTrackedEdit();
+    $("#codeEditor").value="";syncTextareaToActiveFile();updateLines();renderFileTree();renderFileTabs();$("#console").textContent="Editor limpo.";
+    finishTrackedEdit(historyBefore);
+    toast("Código limpo.");
   }
-};
+}
+$("#clearBtn").onclick=clearEditorCode;
 
 function validateChallenge(code, lang, challengeId){
   const c=challenges.find(x=>x.id===challengeId);
@@ -1840,22 +2777,94 @@ function validateChallenge(code, lang, challengeId){
   }
 }
 
-function runCode(){
-  const code=$("#codeEditor").value, lang=$("#language").value;
-  $("#console").textContent="Executado. As mensagens do console aparecem aqui.";
-  if(lang==="javascript"){
-    const safe=code.replace(/<\/script>/gi,"<\\/script>");
-    $("#preview").srcdoc=`<!doctype html><html><body style="font-family:Arial;padding:20px"><script>
+function normalizeAssetReference(value){
+  return String(value||"").split("#")[0].split("?")[0].trim().replace(/^\.\//,"").replace(/^\//,"");
+}
+
+function findAssetFile(files,reference){
+  const target=normalizeAssetReference(reference);
+  if(!target) return null;
+  const exact=files.find(file=>normalizeAssetReference(getNodePath(file))===target);
+  if(exact) return exact;
+  return files.find(file=>file.name===target.split("/").pop())||null;
+}
+
+function composeProjectHtml(project){
+  const htmlFile=getPrimaryFile(project);
+  if(!htmlFile) return null;
+  let html=htmlFile.content||"";
+  const cssFiles=(project.files||[]).filter(file=>getFileExtension(file.name)==="css");
+  const jsFiles=(project.files||[]).filter(file=>["js","mjs","cjs"].includes(getFileExtension(file.name)));
+  const usedCss=new Set(), usedJs=new Set();
+
+  html=html.replace(/<link\b([^>]*?)\bhref\s*=\s*["']([^"']+)["']([^>]*)>/gi,(tag,a,href,b)=>{
+    const file=findAssetFile(cssFiles,href);
+    if(!file) return tag;
+    usedCss.add(String(file.id));
+    return `<style data-luzacode-file="${escapeHtml(getNodePath(file))}">\n${String(file.content||"").replace(/<\/style>/gi,"<\\/style>")}\n</style>`;
+  });
+
+  html=html.replace(/<script\b([^>]*?)\bsrc\s*=\s*["']([^"']+)["']([^>]*)>\s*<\/script>/gi,(tag,a,src,b)=>{
+    const file=findAssetFile(jsFiles,src);
+    if(!file) return tag;
+    usedJs.add(String(file.id));
+    const attrs=`${a} ${b}`.trim();
+    const content=String(file.content||"").replace(/<\/script>/gi,"<\\/script>");
+    return `<script${attrs?` ${attrs}`:""} data-luzacode-file="${escapeHtml(getNodePath(file))}">\n${content}\n</script>`;
+  });
+
+  const unusedCss=cssFiles.filter(file=>!usedCss.has(String(file.id)));
+  const unusedJs=jsFiles.filter(file=>!usedJs.has(String(file.id)));
+  if(unusedCss.length){
+    const css=`\n<style data-luzacode-assets>\n${unusedCss.map(file=>String(file.content||"").replace(/<\/style>/gi,"<\\/style>")).join("\n")}\n</style>\n`;
+    if(/<\/head>/i.test(html)) html=html.replace(/<\/head>/i,css+"</head>");
+    else html=css+html;
+  }
+  if(unusedJs.length){
+    const js=`\n<script data-luzacode-assets>\n${unusedJs.map(file=>String(file.content||"").replace(/<\/script>/gi,"<\\/script>")).join("\n")}\n</script>\n`;
+    if(/<\/body>/i.test(html)) html=html.replace(/<\/body>/i,js+"</body>");
+    else html+=js;
+  }
+
+  return html.replace(/<script([^>]*)>/gi,(open,attrs)=>open.includes("data-luzacode-console")?open:`<script${attrs} data-luzacode-console="1">console.log=(...a)=>parent.postMessage({type:"log",data:a.map(String).join(" ")},"*");console.error=(...a)=>parent.postMessage({type:"error",data:a.map(String).join(" ")},"*");`);
+}
+
+function runJavaScriptInPreview(code){
+  const safe=String(code||"").replace(/<\/script>/gi,"<\\/script>");
+  $("#preview").srcdoc=`<!doctype html><html><body style="font-family:Arial;padding:20px"><script data-luzacode-console="1">
     console.log=(...a)=>parent.postMessage({type:"log",data:a.map(String).join(" ")},"*");
     console.error=(...a)=>parent.postMessage({type:"error",data:a.map(String).join(" ")},"*");
     try{${safe}}catch(e){parent.postMessage({type:"error",data:e.message},"*")}
     <\/script></body></html>`;
-  } else {
-    const safe=code.replace(/<script>/gi,'<script>console.log=(...a)=>parent.postMessage({type:"log",data:a.map(String).join(" ")},"*");console.error=(...a)=>parent.postMessage({type:"error",data:a.map(String).join(" ")},"*");');
-    $("#preview").srcdoc=safe;
+}
+
+function runCode(){
+  ensureEditorProject();
+  syncTextareaToActiveFile();
+  const activeFile=getFileById(activeFileId);
+  if(activeFile?.binary){
+    $("#console").textContent="Este ficheiro é binário e não pode ser executado como código de texto. Seleccione um ficheiro HTML, CSS ou JavaScript.";
+    toast("Seleccione um ficheiro de código para executar.");
+    return;
   }
+  const htmlFile=editorProject.files.find(file=>getFileExtension(file.name)==="html"&&!file.binary);
+  const activeLang=getFileLanguage(activeFile);
+  $("#console").textContent="Executado. As mensagens do console aparecem aqui.";
+
+  if(htmlFile){
+    const composed=composeProjectHtml(editorProject)||"";
+    $("#preview").srcdoc=composed;
+  }else if(activeLang==="javascript"||$("#language").value==="javascript"){
+    runJavaScriptInPreview(activeFile?.content||"");
+  }else if(activeLang==="css"){
+    const safeCss=String(activeFile?.content||"");
+    $("#preview").srcdoc=`<!doctype html><html><head><style>${safeCss.replace(/<\/style>/gi,"<\\/style>")}</style></head><body><div style="font-family:Arial;padding:20px">Pré-visualização do CSS. Crie um <strong>index.html</strong> para aplicar este estilo ao projeto.</div></body></html>`;
+  }else{
+    $("#preview").srcdoc=`<!doctype html><html><body style="font-family:Arial;padding:20px"><pre>${escapeHtml(activeFile?.content||"")}</pre></body></html>`;
+  }
+
   if(activeChallengeId!==null && !completedChallenges.includes(activeChallengeId)){
-    if(validateChallenge(code,lang,activeChallengeId)){
+    if(validateChallenge(activeFile?.content||"",$("#language").value,activeChallengeId)){
       completedChallenges.push(activeChallengeId);
       localStorage.setItem("luzacode_completed_challenges",JSON.stringify(completedChallenges));
       if(currentUser) syncChallengeToCloud(activeChallengeId,true);
@@ -1875,53 +2884,179 @@ window.addEventListener("message",e=>{
 });
 
 function saveProject(){
+  ensureEditorProject();
+  flushPendingTextHistory();
+  syncTextareaToActiveFile();
   const name=$("#projectName").value.trim()||"Meu projeto";
-  const code=$("#codeEditor").value;
   const lang=$("#language").value;
+  editorProject.name=name;
+  editorProject.lang=lang;
+  editorProject.code=getPrimaryFile(editorProject)?.content||"";
+  editorProject.updated=new Date().toISOString();
+
   if(currentProjectId){
-    const p=projects.find(x=>x.id===currentProjectId);
-    if(p){p.name=name;p.code=code;p.lang=lang;p.updated=new Date().toISOString();}
-  }else{
-    const p={id:Date.now().toString(),name,code,lang,favorite:false,updated:new Date().toISOString()};
-    projects.unshift(p); currentProjectId=p.id;
+    const index=projects.findIndex(x=>String(x.id)===String(currentProjectId));
+    if(index>=0){
+      const existing=projects[index];
+      editorProject.favorite=!!existing.favorite;
+      editorProject.created=existing.created||editorProject.created;
+      projects[index]=normalizeProject(editorProject);
+    }else{
+      currentProjectId=null;
+    }
   }
+  if(!currentProjectId){
+    const saved=normalizeProject({...editorProject,id:createNodeId("project")});
+    projects.unshift(saved);
+    currentProjectId=saved.id;
+    editorProject=saved;
+  }
+  const stored=projects.find(x=>String(x.id)===String(currentProjectId));
+  if(stored){editorProject=stored;$("#projectName").value=stored.name;}
+  editorDirty=false;
   localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));
-  renderProjects(); toast("Projeto guardado.");
-  if(currentUser){ syncProjectToCloud(projects.find(x=>x.id===currentProjectId)); }
+  renderProjects(); renderFileSystem(); toast("Projeto guardado.");
+  syncHistoryBaseline();
+  if(currentUser){ syncProjectToCloud(editorProject); }
 }
 $("#saveBtn").onclick=saveProject;
 
 function openProject(id){
-  const p=projects.find(x=>x.id===id); if(!p) return;
-  currentProjectId=p.id; $("#projectName").value=p.name; $("#codeEditor").value=p.code; $("#language").value=p.lang||"html";
-  updateLines(); $("#console").textContent=`Projeto “${p.name}” aberto.`;
+  const source=projects.find(x=>String(x.id)===String(id)); if(!source) return;
+  editorProject=normalizeProject(source);
+  currentProjectId=editorProject.id;
+  activeFileId=String(getPrimaryFile(editorProject)?.id||editorProject.files[0]?.id||"");
+  selectedFolderId=null;
+  window.openFileIds=[activeFileId];
+  editorDirty=false;
+  $("#projectName").value=editorProject.name;
+  $("#language").value=editorProject.lang||"html";
+  showFileInEditor(getFileById(activeFileId));
+  updateLines(); renderFileSystem();
+  $("#console").textContent=`Projeto “${editorProject.name}” aberto.`;
+  fileClipboard=null;
+  resetEditorHistory();
   showPage("write");
 }
 function deleteProject(id){
   if(!confirm("Tem certeza que deseja apagar este projeto?")) return;
-  projects=projects.filter(p=>p.id!==id);
+  projects=projects.filter(p=>String(p.id)!==String(id));
   localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects));
   if(currentUser) deleteProjectFromCloud(id);
+  if(String(currentProjectId)===String(id)) resetEditor();
   renderProjects(); toast("Projeto apagado.");
 }
 function toggleFavorite(id){
-  const p=projects.find(x=>x.id===id); if(!p) return;
+  const p=projects.find(x=>String(x.id)===String(id)); if(!p) return;
   p.favorite=!p.favorite; localStorage.setItem("luzacode_projects_v1",JSON.stringify(projects)); if(currentUser) syncProjectToCloud(p); renderProjects();
 }
 function downloadProject(id){
-  const p=projects.find(x=>x.id===id); if(!p) return;
-  const safe=(p.name||"projeto").replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-").toLowerCase()||"projeto";
-  if(p.lang==="javascript"){
-    downloadBlob(p.code,`${safe}.js`,"text/javascript");
-  }else{
-    downloadBlob(p.code,`${safe}.html`,"text/html");
+  openDownloadDialog(id);
+}
+
+function projectNodePath(project,node){
+  const names=[node.name];
+  let parentId=node.parentId||null;
+  const seen=new Set();
+  while(parentId&&!seen.has(String(parentId))){
+    seen.add(String(parentId));
+    const folder=(project.folders||[]).find(item=>String(item.id)===String(parentId));
+    if(!folder) break;
+    names.unshift(folder.name);
+    parentId=folder.parentId||null;
   }
-  toast("Download iniciado.");
+  return names.join("/");
+}
+function openDownloadDialog(id){
+  const source=projects.find(x=>String(x.id)===String(id));
+  if(!source) return;
+  const project=normalizeProject(source);
+  const files=project.files.slice().sort((a,b)=>projectNodePath(project,a).localeCompare(projectNodePath(project,b),"pt"));
+  const modal=document.createElement("div");
+  modal.className="modal download-modal";
+  modal.innerHTML=`<div class="modal-box download-box" role="dialog" aria-modal="true" aria-labelledby="downloadTitle">\
+    <button class="modal-close" type="button" aria-label="Fechar">×</button>\
+    <span class="eyebrow">EXPORTAR PROJETO</span><h2 id="downloadTitle">Escolher ficheiros para baixar</h2>\
+    <p class="download-description">Projeto: <strong>${escapeHtml(project.name)}</strong>. Seleccione os ficheiros que pretende exportar.</p>\
+    <div class="download-select-all"><label><input type="checkbox" id="downloadSelectAll" checked> Seleccionar todos</label><span>${files.length} ficheiro(s)</span></div>\
+    <div class="download-file-list">${files.map(file=>{const path=projectNodePath(project,file);const kb=file.binary?Math.max(1,Math.round(file.content.length*.75/1024)):Math.max(1,Math.round(new Blob([file.content]).size/1024));return `<label class="download-file-option"><input type="checkbox" class="download-file-check" value="${escapeHtml(file.id)}" checked><span class="download-file-icon">${getFileIcon(file)}</span><span class="download-file-meta"><strong>${escapeHtml(path)}</strong><small>${file.binary?"Ficheiro binário":"Ficheiro de texto"} · ${kb} KB</small></span></label>`;}).join("")}</div>\
+    <div class="download-actions"><button type="button" class="secondary" id="downloadSelectedBtn">↓ Baixar</button><button type="button" class="primary" id="downloadZipBtn">▣ Baixar ZIP</button></div>\
+    <p class="download-note">O ZIP mantém a estrutura das pastas. Ao baixar ficheiros separados, o navegador pode pedir permissão para vários downloads.</p>\
+  </div>`;
+  document.body.appendChild(modal);
+  const close=()=>modal.remove();
+  modal.querySelector(".modal-close").onclick=close;
+  modal.addEventListener("click",e=>{if(e.target===modal)close();});
+  const selectAll=modal.querySelector("#downloadSelectAll"),checks=()=>Array.from(modal.querySelectorAll(".download-file-check"));
+  selectAll.onchange=()=>checks().forEach(check=>check.checked=selectAll.checked);
+  modal.querySelector(".download-file-list").addEventListener("change",()=>{const list=checks();selectAll.checked=list.every(c=>c.checked);selectAll.indeterminate=list.some(c=>c.checked)&&!selectAll.checked;});
+  function selectedFiles(){const ids=new Set(checks().filter(c=>c.checked).map(c=>String(c.value)));return files.filter(file=>ids.has(String(file.id)));}
+  modal.querySelector("#downloadSelectedBtn").onclick=()=>{
+    const chosen=selectedFiles();
+    if(!chosen.length){toast("Seleccione pelo menos um ficheiro.");return;}
+    chosen.forEach((file,index)=>{
+      const path=projectNodePath(project,file);
+      const basename=path.replace(/\//g,"__").replace(/[^\p{L}\p{N}._() -]+/gu,"_");
+      downloadBlob(fileBytes(file),basename,file.binary?(file.mimeType||"application/octet-stream"):mimeForFile(file.name));
+    });
+    toast(`${chosen.length} ficheiro(s) enviado(s) para download.`);
+    close();
+  };
+  modal.querySelector("#downloadZipBtn").onclick=async()=>{
+    const chosen=selectedFiles();
+    if(!chosen.length){toast("Seleccione pelo menos um ficheiro.");return;}
+    const btn=modal.querySelector("#downloadZipBtn");btn.disabled=true;btn.textContent="A preparar ZIP…";
+    try{
+      const zip=buildZip(project,chosen);
+      const safe=(project.name||"projeto").replace(/[^\p{L}\p{N}_ -]+/gu,"").trim().replace(/\s+/g,"-")||"projeto";
+      downloadBlob(zip,`${safe}.zip`,"application/zip");
+      toast(`ZIP com ${chosen.length} ficheiro(s) preparado.`);close();
+    }catch(err){console.error("Falha ao criar ZIP:",err);toast("Não foi possível criar o ZIP. Tente baixar os ficheiros separados.");btn.disabled=false;btn.textContent="▣ Baixar ZIP";}
+  };
+}
+function mimeForFile(name){
+  const ext=getFileExtension(name);const types={html:"text/html",htm:"text/html",css:"text/css",js:"text/javascript",mjs:"text/javascript",json:"application/json",txt:"text/plain",md:"text/markdown",svg:"image/svg+xml",xml:"application/xml",csv:"text/csv",py:"text/x-python",pdf:"application/pdf",png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",gif:"image/gif",webp:"image/webp",ico:"image/x-icon"};
+  return types[ext]||"application/octet-stream";
+}
+function fileBytes(file){
+  if(file.binary) return base64ToBytes(file.content);
+  return new TextEncoder().encode(String(file.content??""));
+}
+function concatBytes(parts){
+  const total=parts.reduce((sum,part)=>sum+part.length,0);const result=new Uint8Array(total);let offset=0;
+  for(const part of parts){result.set(part,offset);offset+=part.length;}return result;
+}
+function crc32(bytes){
+  let crc=0xffffffff;
+  for(let i=0;i<bytes.length;i++){crc^=bytes[i];for(let j=0;j<8;j++)crc=(crc&1)?(crc>>>1)^0xedb88320:crc>>>1;}
+  return (crc^0xffffffff)>>>0;
+}
+function zipDosDate(date=new Date()){
+  const time=((date.getHours()&31)<<11)|((date.getMinutes()&63)<<5)|((Math.floor(date.getSeconds()/2))&31);
+  const day=((Math.max(1980,date.getFullYear())-1980)<<9)|((date.getMonth()+1)<<5)|date.getDate();
+  return {time,date:day};
+}
+function buildZip(project,files){
+  const encoder=new TextEncoder(),localParts=[],centralParts=[];let offset=0;
+  const dos=zipDosDate();
+  files.forEach(file=>{
+    const path=projectNodePath(project,file).replace(/\\/g,"/");
+    const nameBytes=encoder.encode(path),data=fileBytes(file),crc=crc32(data);
+    const local=new Uint8Array(30+nameBytes.length);const lv=new DataView(local.buffer);
+    lv.setUint32(0,0x04034b50,true);lv.setUint16(4,20,true);lv.setUint16(6,0x0800,true);lv.setUint16(8,0,true);lv.setUint16(10,dos.time,true);lv.setUint16(12,dos.date,true);lv.setUint32(14,crc,true);lv.setUint32(18,data.length,true);lv.setUint32(22,data.length,true);lv.setUint16(26,nameBytes.length,true);lv.setUint16(28,0,true);local.set(nameBytes,30);
+    localParts.push(local,data);
+    const central=new Uint8Array(46+nameBytes.length);const cv=new DataView(central.buffer);
+    cv.setUint32(0,0x02014b50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);cv.setUint16(8,0x0800,true);cv.setUint16(10,0,true);cv.setUint16(12,dos.time,true);cv.setUint16(14,dos.date,true);cv.setUint32(16,crc,true);cv.setUint32(20,data.length,true);cv.setUint32(24,data.length,true);cv.setUint16(28,nameBytes.length,true);cv.setUint16(30,0,true);cv.setUint16(32,0,true);cv.setUint16(34,0,true);cv.setUint16(36,0,true);cv.setUint32(38,0,true);cv.setUint32(42,offset,true);central.set(nameBytes,46);centralParts.push(central);
+    offset+=local.length+data.length;
+  });
+  const centralBytes=concatBytes(centralParts),localBytes=concatBytes(localParts),end=new Uint8Array(22),ev=new DataView(end.buffer);
+  ev.setUint32(0,0x06054b50,true);ev.setUint16(4,0,true);ev.setUint16(6,0,true);ev.setUint16(8,files.length,true);ev.setUint16(10,files.length,true);ev.setUint32(12,centralBytes.length,true);ev.setUint32(16,localBytes.length,true);ev.setUint16(20,0,true);
+  return new Blob([localBytes,centralBytes,end],{type:"application/zip"});
 }
 function downloadBlob(content,name,type){
-  const blob=new Blob([content],{type});
-  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href),500);
+  const blob=content instanceof Blob?content:new Blob([content],{type:type||"application/octet-stream"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.style.display="none";document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1500);
 }
 
 function projectCard(p){
@@ -1943,13 +3078,16 @@ function renderProjects(){
   $("#favoritesGrid").innerHTML=fav.length?fav.map(projectCard).join(""):`<div class="empty"><strong>Nenhum favorito.</strong><span>Marque um projeto com ★ para encontrá-lo aqui.</span></div>`;
 }
 function formatDate(d){return new Date(d).toLocaleDateString("pt-PT",{day:"2-digit",month:"2-digit",year:"numeric"});}
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;",'\'':"&#039;"}[c]));}
 
 function renderManual(){
   const filter=$("#manualFilter").value;
   const groups=manual.filter(m=>filter==="all"||m.id===filter);
   if(!groups.some(g=>g.id===manualLanguage)) manualLanguage=groups[0]?.id||"html";
-  $("#manualNav").innerHTML=groups.map(g=>`<button class="${g.id===manualLanguage?"active":""}" onclick="selectManualLanguage('${g.id}')"><strong>${g.name}</strong><small>${g.items.length} temas</small></button>`).join("");
+  const shortcutsNav=`<button type="button" class="${manualShortcutsActive?"active":""}" onclick="selectShortcutManual()"><strong>Manual de atalhos do LUZACODE</strong><small>15 atalhos • V1</small></button>`;
+  const languageNav=groups.map(g=>`<button type="button" class="${!manualShortcutsActive&&g.id===manualLanguage?"active":""}" onclick="selectManualLanguage('${g.id}')"><strong>${g.name}</strong><small>${g.items.length} temas</small></button>`).join("");
+  $("#manualNav").innerHTML=shortcutsNav+languageNav;
+  if(manualShortcutsActive){renderShortcutManual();return;}
   const g=manual.find(x=>x.id===manualLanguage)||groups[0];
   if(!g){$("#manualContent").innerHTML="";return;}
   if(g.id==="python") {
@@ -1970,6 +3108,42 @@ function renderManual(){
   const sectionNav=$("#manualContent .manual-intro");
   if(sectionNav) sectionNav.scrollIntoView({block:"start",behavior:"smooth"});
 }
+function renderShortcutManual(){
+  const shortcuts=[
+    ["Ctrl + C","Copiar texto ou ficheiro","No editor, copia o texto seleccionado. Na árvore de ficheiros, copia o ficheiro seleccionado para poderes colá-lo como cópia noutra pasta."],
+    ["Ctrl + V","Colar ou colocar ficheiro","No editor, cola texto da área de transferência. Depois de copiares um ficheiro, cria uma cópia na pasta seleccionada; depois de cortares um ficheiro, move-o para a pasta seleccionada. Se nenhuma pasta estiver seleccionada, usa a raiz do projecto."],
+    ["Ctrl + X","Cortar texto ou ficheiro","No editor, corta o texto seleccionado. Na árvore de ficheiros, marca o ficheiro seleccionado para ser movido; depois escolhe a pasta de destino e prime Ctrl + V."],
+    ["Ctrl + Z","Desfazer","Reverte a última alteração de código ou operação suportada no projecto, como mover um ficheiro."],
+    ["Ctrl + Y","Refazer","Repõe uma alteração que acabou de ser desfeita, quando ela estiver disponível no histórico."],
+    ["Ctrl + Shift + S","Guardar projecto","Guarda o projecto actual no LUZACODE."],
+    ["Ctrl + Shift + K","Duplicar","No editor, duplica o texto seleccionado ou a linha actual. Na árvore de ficheiros, cria uma cópia do ficheiro seleccionado."],
+    ["Ctrl + A","Seleccionar todo o código","Com o editor de código activo, selecciona todo o código do ficheiro actual."],
+    ["Ctrl + Shift + G","Nova pasta","Cria uma pasta na localização seleccionada no explorador de ficheiros; se não houver pasta seleccionada, cria-a na raiz."],
+    ["Ctrl + Shift + E","Novo ficheiro","Cria um novo ficheiro na pasta seleccionada; se não houver pasta seleccionada, cria-o na raiz."],
+    ["Ctrl + Shift + L","Limpar código","Pede confirmação antes de apagar o código do ficheiro actualmente aberto. Se confirmares, podes tentar recuperar a alteração com Ctrl + Z."],
+    ["Alt + Shift + F","Formatar código","Organiza a formatação básica do código do ficheiro actual. O resultado depende do tipo de ficheiro."],
+    ["Ctrl + M","Números de linhas","Mostra ou oculta os números das linhas no editor."],
+    ["Ctrl + Enter","Executar resultado","Executa ou actualiza a pré-visualização do projecto."],
+    ["Ctrl + B","Barra lateral","Oculta a barra lateral se estiver visível e volta a mostrá-la se estiver oculta."]
+  ];
+  const rows=shortcuts.map(([key,action,description])=>`<tr><td><kbd class="shortcut-key">${escapeHtml(key)}</kbd></td><td><strong>${escapeHtml(action)}</strong></td><td>${escapeHtml(description)}</td></tr>`).join("");
+  $("#manualContent").innerHTML=`
+    <div class="manual-intro">
+      <div class="manual-intro-top"><button class="manual-expand-btn" id="manualExpandBtn" onclick="toggleManualExpanded()" title="Expandir manual">⛶ <span>Expandir</span></button></div>
+      <span class="language-badge">GUIA DA V1</span>
+      <h2>Manual de atalhos do LUZACODE</h2>
+      <p>Este manual explica os atalhos de teclado disponíveis na Versão 1 e mostra quando cada um deve ser utilizado.</p>
+      <div class="manual-summary"><span>15 atalhos</span><span>Editor + ficheiros</span><span>LUZACODE V1</span></div>
+    </div>
+    <article class="topic-card shortcut-manual-help">
+      <h3>Como usar os atalhos</h3>
+      <p>Prima as teclas indicadas ao mesmo tempo. Por exemplo, em <kbd class="shortcut-key">Ctrl + Shift + S</kbd>, mantenha Ctrl e Shift premidas e depois prima S.</p>
+      <p>Alguns atalhos dependem do local activo: no editor, copiar e cortar trabalham com texto seleccionado; na árvore de ficheiros, trabalham com o ficheiro seleccionado. Para mover um ficheiro, seleccione-o, prima <kbd class="shortcut-key">Ctrl + X</kbd>, clique na pasta de destino e prima <kbd class="shortcut-key">Ctrl + V</kbd>. Também pode arrastar o ficheiro para cima da pasta.</p>
+      <p>Quando criar uma pasta ou um ficheiro, o LUZACODE usa a pasta seleccionada como destino. Se nenhuma pasta estiver seleccionada, cria o item na raiz do projecto.</p>
+    </article>
+    <div class="shortcut-manual-table-wrap"><table class="shortcut-manual-table"><thead><tr><th>Atalho</th><th>Função</th><th>Como funciona</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+function selectShortcutManual(){manualShortcutsActive=true;renderManual();}
 function toggleManualExpanded(){
   const page=$("#manual");
   if(!page) return;
@@ -1980,10 +3154,25 @@ function toggleManualExpanded(){
   if(expanded) window.scrollTo({top:0,behavior:"smooth"});
 }
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#manual")?.classList.contains("manual-expanded")) toggleManualExpanded();});
-function selectManualLanguage(id){manualLanguage=id;renderManual();}
-$("#manualFilter").onchange=()=>renderManual();
+function selectManualLanguage(id){manualShortcutsActive=false;manualLanguage=id;renderManual();}
+$("#manualFilter").onchange=()=>{manualShortcutsActive=false;renderManual();};
 function useExample(code,lang){
-  currentProjectId=null; $("#projectName").value="Exemplo - "+(manual.find(x=>x.id===lang)?.name||lang); $("#language").value=lang==="javascript"?"javascript":"html"; $("#codeEditor").value=code; updateLines(); showPage("write"); toast("Exemplo colocado no editor.");
+  editorProject=makeDefaultProject();
+  currentProjectId=null;
+  editorProject.name="Exemplo - "+(manual.find(x=>x.id===lang)?.name||lang);
+  editorProject.lang=lang==="javascript"?"javascript":"html";
+  const targetExt=lang==="javascript"?"js":"html";
+  const target=editorProject.files.find(file=>getFileExtension(file.name)===targetExt)||editorProject.files[0];
+  target.content=code;
+  activeFileId=String(target.id);
+  selectedFolderId=target.parentId||null;
+  window.openFileIds=[activeFileId];
+  editorDirty=true;
+  $("#projectName").value=editorProject.name;
+  $("#language").value=editorProject.lang;
+  $("#codeEditor").readOnly=false;$("#codeEditor").setAttribute("aria-label","Editor de código");
+  $("#codeEditor").value=target.content;
+  updateLines(); renderFileSystem(); showPage("write"); toast("Exemplo colocado no editor.");
 }
 
 function courseLevel(done){
@@ -2040,31 +3229,87 @@ function renderDailyChallenge(){
 function startChallenge(id){
   const c=challenges.find(x=>x.id===id);
   if(!c) return;
-  $("#projectName").value="Desafio - "+c.title;
-  $("#language").value=(c.lang.includes("JavaScript")?"javascript":"html");
-  $("#codeEditor").value=`<!-- ${c.title} -->\n<!-- ${c.goal} -->\n\n`;
-  updateLines(); $("#console").textContent="Desafio iniciado. Tente resolver sem copiar a solução.";
+  editorProject=makeDefaultProject();
+  currentProjectId=null;
+  editorProject.name="Desafio - "+c.title;
+  editorProject.lang=c.lang.includes("JavaScript")?"javascript":"html";
+  const target=editorProject.files.find(file=>getFileExtension(file.name)===(editorProject.lang==="javascript"?"js":"html"))||editorProject.files[0];
+  target.content=`<!-- ${c.title} -->\n<!-- ${c.goal} -->\n\n`;
+  activeFileId=String(target.id);
+  selectedFolderId=null;
+  window.openFileIds=[activeFileId];
+  editorDirty=true;
+  $("#projectName").value=editorProject.name;
+  $("#language").value=editorProject.lang;
+  $("#codeEditor").readOnly=false;$("#codeEditor").setAttribute("aria-label","Editor de código");
+  $("#codeEditor").value=target.content;
+  updateLines(); renderFileSystem(); $("#console").textContent="Desafio iniciado. Tente resolver sem copiar a solução.";
   activeChallengeId=id;
   showPage("write");
   toast("Desafio iniciado.");
 }
 
 function setupResize(){
-  const handle=$("#resizeHandle"), workspace=$("#workspace");
-  let dragging=false;
-  handle.onmousedown=()=>dragging=true;
-  window.onmouseup=()=>dragging=false;
-  window.onmousemove=e=>{
-    if(!dragging || $("#codePanel").classList.contains("fullscreen")) return;
-    const rect=workspace.getBoundingClientRect();
-    let percent=((e.clientX-rect.left)/rect.width)*100;
-    percent=Math.max(30,Math.min(70,percent));
-    $("#codePanel").style.flex=`0 0 ${percent}%`;
-    $(".result-panel").style.flex=`1 1 ${100-percent}%`;
-  };
+  const handle=$("#resizeHandle"),workspace=$("#workspace"),codePanel=$("#codePanel"),resultPanel=$("#resultPanel");
+  if(!handle||!workspace||!codePanel||!resultPanel)return;
+  let dragging=false,startX=0,startY=0,startCodeWidth=0,startCodeHeight=0;
+  handle.addEventListener("pointerdown",e=>{
+    if(window.innerWidth<=760||codePanel.classList.contains("fullscreen")||resultPanel.classList.contains("result-fullscreen"))return;
+    e.preventDefault();dragging=true;startX=e.clientX;startY=e.clientY;startCodeWidth=codePanel.getBoundingClientRect().width;startCodeHeight=codePanel.getBoundingClientRect().height;
+    handle.setPointerCapture?.(e.pointerId);document.body.classList.add("is-resizing-panels");
+  });
+  handle.addEventListener("pointermove",e=>{
+    if(!dragging)return;
+    const filesPanel=$("#projectFilesPanel");
+    const available=workspace.clientWidth-(filesPanel?.getBoundingClientRect().width||0)-handle.getBoundingClientRect().width;
+    const min=230;
+    const width=Math.max(min,Math.min(available-min,startCodeWidth+(e.clientX-startX)));
+    if(available>min*2){codePanel.style.flex=`0 0 ${width}px`;codePanel.style.width=`${width}px`;resultPanel.style.flex="1 1 0";resultPanel.style.width="auto";}
+  });
+  const stop=()=>{dragging=false;document.body.classList.remove("is-resizing-panels");};
+  handle.addEventListener("pointerup",stop);handle.addEventListener("pointercancel",stop);window.addEventListener("blur",stop);
+  window.addEventListener("resize",()=>{if(window.innerWidth<=760){codePanel.style.flex="";codePanel.style.width="";resultPanel.style.flex="";resultPanel.style.width="";}});
 }
 setupResize();
 
+function setupSidebarControls(){
+  const sidebar=$("#sidebar"),main=$(".main"),handle=$("#sidebarResizeHandle"),hide=$("#hideSidebarBtn"),show=$("#showSidebarBtn"),menu=$("#menuBtn");
+  if(!sidebar||!main||!handle||!hide||!show||!menu)return;
+  const savedWidth=parseInt(localStorage.getItem("luzacode_sidebar_width")||"255",10);
+  const applyWidth=value=>{
+    const width=Math.max(190,Math.min(420,Math.round(value)));
+    document.documentElement.style.setProperty("--sidebar-width",`${width}px`);
+    localStorage.setItem("luzacode_sidebar_width",String(width));
+  };
+  applyWidth(Number.isFinite(savedWidth)?savedWidth:255);
+  if(localStorage.getItem("luzacode_sidebar_hidden")==="1")document.body.classList.add("sidebar-collapsed");
+  const applyHidden=hidden=>{
+    document.body.classList.toggle("sidebar-collapsed",hidden);
+    localStorage.setItem("luzacode_sidebar_hidden",hidden?"1":"0");
+    menu.setAttribute("aria-label",hidden?"Mostrar barra lateral":"Abrir menu");
+    menu.title=hidden?"Mostrar barra lateral":"Menu";
+    hide.setAttribute("aria-hidden",hidden?"true":"false");
+    show.setAttribute("aria-expanded",hidden?"false":"true");
+  };
+  applyHidden(document.body.classList.contains("sidebar-collapsed"));
+  hide.onclick=()=>{applyHidden(true);sidebar.classList.remove("open");};
+  show.onclick=()=>{applyHidden(false);if(window.innerWidth<=760)sidebar.classList.add("open");};
+  menu.onclick=()=>{
+    if(window.innerWidth<=760){
+      if(document.body.classList.contains("sidebar-collapsed"))applyHidden(false);
+      sidebar.classList.toggle("open");
+    }else if(document.body.classList.contains("sidebar-collapsed")){applyHidden(false);}
+  };
+  let resizing=false,startX=0,startWidth=255;
+  handle.addEventListener("pointerdown",e=>{
+    if(window.innerWidth<=760||document.body.classList.contains("sidebar-collapsed"))return;
+    resizing=true;startX=e.clientX;startWidth=sidebar.getBoundingClientRect().width;e.preventDefault();handle.setPointerCapture?.(e.pointerId);document.body.classList.add("is-resizing-sidebar");
+  });
+  handle.addEventListener("pointermove",e=>{if(resizing)applyWidth(startWidth+(e.clientX-startX));});
+  const stop=()=>{resizing=false;document.body.classList.remove("is-resizing-sidebar");};
+  handle.addEventListener("pointerup",stop);handle.addEventListener("pointercancel",stop);window.addEventListener("blur",stop);
+}
+setupSidebarControls();
 $("#themeBtn").onclick=()=>{
   document.body.classList.toggle("dark");
   localStorage.setItem("luzacode_dark",document.body.classList.contains("dark")?"1":"0");
@@ -2079,7 +3324,7 @@ $("#globalSearch").addEventListener("input",e=>{
   if(found.length) showPage(found[0].type==="Curso"?"courses":found[0].type==="Desafio"?"challenges":"manual");
 });
 
-$("#codeEditor").value=defaultCode; updateLines(); renderProjects(); renderManual(); renderCourses(); renderChallenges();
+resetEditor(); renderProjects(); renderManual(); renderCourses(); renderChallenges();
 
 // Ajustes de interação para toque no telemóvel — não alteram as funções do V1.
 (function mobileTouchFix(){
